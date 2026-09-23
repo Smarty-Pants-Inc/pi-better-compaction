@@ -5,7 +5,8 @@ English | [中文](README.zh-CN.md)
 A [pi](https://github.com/nicepkg/pi) extension that upgrades context compaction with two coordinated strategies:
 
 1. **OpenAI Responses APIs**, including supported GitHub Copilot models, use the provider's native compaction endpoint, preserving opaque context that plain text summaries lose.
-2. **All other APIs** (Anthropic, Gemini, etc.) can run pi's built-in compaction with a **dedicated cheaper/faster model**, so summarization doesn't consume quota on your primary model.
+2. **Anthropic Messages API** uses Anthropic's on-demand server-side compaction (beta `compact-2026-09-04`) and replays the signed compaction block.
+3. **All other APIs** (Gemini, etc.) can run pi's built-in compaction with a **dedicated cheaper/faster model**, so summarization doesn't consume quota on your primary model.
 
 Everything fails open — if any step cannot proceed, pi's default compaction takes over.
 
@@ -103,9 +104,16 @@ When pi triggers compaction (`session_before_compact`):
    - **V1**: POSTs to `/responses/compact`; receives an opaque compacted window.
    - On success, the compacted window is stored and replayed on subsequent requests via `before_provider_request`.
 
-2. **Not a Responses API, or native compact failed** → if `compactionModel` is configured and differs from the current model, run pi's built-in `compact()` with that model.
+2. **Anthropic Messages API** (`anthropic-messages`) → send Pi's own serialized request for the messages Pi would discard, with `compaction: {type: "summarize"}` and the `compact-2026-09-04` beta:
+   - The response holds one signed `compaction` block. It is stored in the compaction entry's `details`, keyed by provider, API, model and base URL. Its text is also the entry summary.
+   - Later requests for the same provider and model replace Pi's summary message with the block, verbatim, as the first message. Pi's kept messages stay unchanged.
+   - After a switch to another provider or model, Pi's summary is sent instead. A block is never sent to a different provider or model.
+   - If the provider answers a request that carries the block with HTTP 400, the block is retired for the session and Pi's summary is used.
+   - The compaction threshold stays in Pi's `compaction` settings.
 
-3. **No fallback configured** → pi's default compaction runs as if the extension weren't installed.
+3. **Not a native API, or native compact failed** → if `compactionModel` is configured and differs from the current model, run pi's built-in `compact()` with that model.
+
+4. **No fallback configured** → pi's default compaction runs as if the extension weren't installed.
 
 Selection is by API type, not provider — any OpenAI-compatible proxy speaking a Responses API gets a native compact attempt. If the endpoint doesn't support it, the request fails and falls through to the configured fallback.
 
