@@ -65,10 +65,26 @@ export type ExtensionRuntimeDependencies = {
 /** Per-registration state shared by the provider request and response hooks. */
 type RuntimeState = {
 	getThinkingLevel?: () => ThinkingLevel | undefined;
-	appendEntry?: (customType: string, data?: unknown) => void;
 	/** Compaction entry whose block the in-flight provider request carries. */
 	pendingAnthropicReplay?: string;
+	/** Set when a rejected block retired this run; the next settle resends once. */
+	resendAfterBlockRejection?: boolean;
 };
+
+/**
+ * The error text Pi records when Anthropic rejects a replayed block, for example
+ * 400 {"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content.0: invalid `signature` in `compaction` block"}}.
+ * Only a 400 that names the compaction block matches.
+ */
+const ANTHROPIC_BLOCK_REJECTION = /^400\b[\s\S]*\bcompaction`?\s+block\b/;
+
+function isAnthropicBlockRejection(message: AgentMessage): boolean {
+	return (
+		message.role === "assistant" &&
+		message.stopReason === "error" &&
+		ANTHROPIC_BLOCK_REJECTION.test(message.errorMessage ?? "")
+	);
+}
 
 const DEFAULT_DEPENDENCIES: ExtensionRuntimeDependencies = {
 	loadExtensionConfig,
@@ -891,7 +907,6 @@ export function registerExtensionRuntime(
 ): void {
 	const state: RuntimeState = {
 		getThinkingLevel: () => pi.getThinkingLevel?.(),
-		appendEntry: (customType, data) => pi.appendEntry?.(customType, data),
 	};
 
 	pi.on("session_start", (_event, ctx) => {
@@ -927,18 +942,46 @@ export function registerExtensionRuntime(
 	pi.on("session_before_compact", (event, ctx) =>
 		handleSessionBeforeCompact(event, ctx, dependencies, state),
 	);
-	pi.on("before_provider_request", (event, ctx) =>
-		handleBeforeProviderRequest(event, ctx, dependencies, state),
-	);
-	pi.on("after_provider_response", (event, ctx) => {
+	pi.on("before_provider_request", (event, ctx) => {
+		// Any new request, including a queued follow-up, already serves as the resend.
+		state.resendAfterBlockRejection = false;
+		return handleBeforeProviderRequest(event, ctx, dependencies, state);
+	});
+	pi.on("after_provider_response", (event) => {
+		// A status alone cannot tell a rejected block from another 400, so a 400 waits
+		// for turn_end and its error text. Pi 0.87 fires this hook only for 2xx
+		// Anthropic responses, because the SDK throws on an error status first.
+		if (event.status !== 400) state.pendingAnthropicReplay = undefined;
+	});
+	pi.on("turn_end", (event, ctx) => {
 		const compactionEntryId = state.pendingAnthropicReplay;
 		state.pendingAnthropicReplay = undefined;
-		// ponytail: any 400 on a request that carried the block retires the block; the
-		// next request replays Pi's summary instead. A 400 unrelated to the block costs
-		// server-side continuity, never correctness.
-		if (!compactionEntryId || event.status !== 400) return;
-		state.appendEntry?.(ANTHROPIC_BLOCK_REJECTED_ENTRY, { compactionEntryId });
-		notifyWarning(ctx, "provider rejected the Anthropic compaction block; replaying Pi's summary from now on");
+		if (!compactionEntryId || !isAnthropicBlockRejection(event.message)) return undefined;
+		if (!event.messageEntryId) {
+			// ponytail: Pi before 0.87 has no turn_end boundary results, so record the
+			// retirement directly; there, the next prompt recovers instead of a resend.
+			pi.appendEntry(ANTHROPIC_BLOCK_REJECTED_ENTRY, { compactionEntryId });
+			notifyWarning(ctx, "provider rejected the Anthropic compaction block; replaying Pi's summary from now on");
+			return undefined;
+		}
+		state.resendAfterBlockRejection = true;
+		notifyWarning(ctx, "provider rejected the Anthropic compaction block; resending once with Pi's summary");
+		return {
+			entries: [
+				// Later requests replay Pi's summary instead of the block.
+				{ type: "custom", customType: ANTHROPIC_BLOCK_REJECTED_ENTRY, data: { compactionEntryId } },
+				// Omit the failed reply from model context so the run can resend; the log keeps it.
+				{ type: "context_edit", targetId: event.messageEntryId, replacement: null },
+			],
+		};
+	});
+	// Pi ends a run on an error turn and ignores turn_end continuation there, so the
+	// resend happens at the settle boundary. The flag allows exactly one resend, and
+	// that request no longer carries the retired block, so it cannot loop.
+	pi.on("agent_before_settle", () => {
+		if (!state.resendAfterBlockRejection) return undefined;
+		state.resendAfterBlockRejection = false;
+		return { continue: true };
 	});
 
 	pi.on("session_compact_failed", (event, ctx) => {
