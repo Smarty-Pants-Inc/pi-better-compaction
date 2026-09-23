@@ -54,6 +54,7 @@ type HookHarnessOptions = {
 	v2CompactResult?: Record<string, unknown>;
 	config?: Partial<ExtensionConfig>;
 	nativeFallbackResult?: Record<string, unknown>;
+	anthropicCompactResult?: Record<string, unknown>;
 };
 
 const defaultModel: TestModel = {
@@ -298,7 +299,9 @@ async function loadHookHarness(options: HookHarnessOptions = {}): Promise<{
 	compactCalls: Array<Record<string, unknown>>;
 	v2CompactCalls: Array<Record<string, unknown>>;
 	fallbackCalls: Array<Record<string, unknown>>;
+	anthropicCalls: Array<Record<string, unknown>>;
 }> {
+	const anthropicCalls: Array<Record<string, unknown>> = [];
 	const compactCalls: Array<Record<string, unknown>> = [];
 	const v2CompactCalls: Array<Record<string, unknown>> = [];
 	const fallbackCalls: Array<Record<string, unknown>> = [];
@@ -341,6 +344,10 @@ async function loadHookHarness(options: HookHarnessOptions = {}): Promise<{
 					}
 				) as never;
 			},
+			executeAnthropicCompaction: async (args: Record<string, unknown>) => {
+				anthropicCalls.push(args);
+				return (options.anthropicCompactResult ?? { ok: false, reason: "request-failed" }) as never;
+			},
 			executeV2Compaction: async (args: Record<string, unknown>) => {
 				v2CompactCalls.push(args);
 				return (
@@ -365,6 +372,7 @@ async function loadHookHarness(options: HookHarnessOptions = {}): Promise<{
 		compactCalls,
 		v2CompactCalls,
 		fallbackCalls,
+		anthropicCalls,
 	};
 }
 
@@ -1005,7 +1013,7 @@ test("non-Responses model routes straight to the native-method fallback", async 
 		tokensBefore: 256,
 		details: { readFiles: [], modifiedFiles: [] },
 	};
-	const { sessionBeforeCompact, compactCalls, fallbackCalls } = await loadHookHarness({
+	const { sessionBeforeCompact, compactCalls, fallbackCalls, anthropicCalls } = await loadHookHarness({
 		nativeFallbackResult: {
 			ok: true,
 			result: fallbackResult,
@@ -1035,7 +1043,9 @@ test("non-Responses model routes straight to the native-method fallback", async 
 		}),
 	)) as { compaction: Record<string, unknown> };
 
-	// The compact endpoint is never touched for a non-Responses API.
+	// The compact endpoint is never touched for a non-Responses API; a failed
+	// Anthropic server compaction fails open to the fallback.
+	expect(anthropicCalls).toHaveLength(1);
 	expect(compactCalls).toHaveLength(0);
 	expect(fallbackCalls).toHaveLength(1);
 	expect(result.compaction).toEqual(fallbackResult);

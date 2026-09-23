@@ -11,6 +11,8 @@ export const REDACTED_VALUE = "[REDACTED]";
 export const RESPONSES_COMPACT_CAPABLE_APIS = ["openai-responses", "openai-codex-responses"] as const;
 export const NATIVE_COMPACTION_STRATEGY = "openai-native-compact-v1";
 export const NATIVE_COMPACTION_STRATEGY_V2 = "openai-native-compact-v2";
+/** Anthropic on-demand compaction; compactedWindow holds the one signed compaction block. */
+export const ANTHROPIC_COMPACTION_STRATEGY = "anthropic-native-compact-v1";
 /** Used as CompactionEntry.summary only when no summary text could be extracted from the compact response. */
 export const NATIVE_COMPACTION_FALLBACK_SUMMARY = "[OpenAI native compaction checkpoint]";
 
@@ -109,6 +111,13 @@ export type RedactOptions = {
 
 export type NativeCompactionStrategy = typeof NATIVE_COMPACTION_STRATEGY;
 export type NativeCompactionStrategyV2 = typeof NATIVE_COMPACTION_STRATEGY_V2;
+export type AnthropicCompactionStrategy = typeof ANTHROPIC_COMPACTION_STRATEGY;
+export type CompactionStrategy = NativeCompactionStrategy | NativeCompactionStrategyV2 | AnthropicCompactionStrategy;
+const COMPACTION_STRATEGIES: readonly unknown[] = [
+	NATIVE_COMPACTION_STRATEGY,
+	NATIVE_COMPACTION_STRATEGY_V2,
+	ANTHROPIC_COMPACTION_STRATEGY,
+];
 
 export type NativeCompactionRequestMeta = {
 	tokensBefore?: number;
@@ -123,7 +132,7 @@ export type NativeCompactionIdentity = {
 };
 
 export type NativeCompactionDetails = NativeCompactionIdentity & {
-	strategy: NativeCompactionStrategy | NativeCompactionStrategyV2;
+	strategy: CompactionStrategy;
 	compactedWindow: unknown[];
 	compactResponseId?: string;
 	createdAt: string;
@@ -252,7 +261,7 @@ export function isNativeCompactionDetails(value: unknown): value is NativeCompac
 	}
 
 	return (
-		(value.strategy === NATIVE_COMPACTION_STRATEGY || value.strategy === NATIVE_COMPACTION_STRATEGY_V2) &&
+		COMPACTION_STRATEGIES.includes(value.strategy) &&
 		isNativeCompactionIdentity(value) &&
 		Array.isArray(value.compactedWindow) &&
 		value.compactedWindow.every(isCompactedWindowItem) &&
@@ -268,7 +277,7 @@ export function isNativeCompactionEntry(value: unknown): value is NativeCompacti
 
 export function createNativeCompactionDetails(
 	input: CreateNativeCompactionDetailsInput,
-	strategy: NativeCompactionStrategy | NativeCompactionStrategyV2 = NATIVE_COMPACTION_STRATEGY,
+	strategy: CompactionStrategy = NATIVE_COMPACTION_STRATEGY,
 ): NativeCompactionDetails {
 	return {
 		strategy,

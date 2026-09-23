@@ -2,7 +2,7 @@
   "name": "@lll9p/pi-better-compaction",
   "version": "0.7.1",
   "type": "module",
-  "description": "Better compaction for pi: native /responses/compact replay for OpenAI Responses APIs, plus a configurable compaction model driving pi's native summarization everywhere else.",
+  "description": "Better compaction for pi: native /responses/compact replay for OpenAI Responses APIs, Anthropic server-side compaction, plus a configurable compaction model driving pi's native summarization everywhere else.",
   "author": "Lilin Lao",
   "license": "MIT",
   "repository": {
@@ -21,6 +21,7 @@
     "pi-package",
     "pi-extension",
     "openai",
+    "anthropic",
     "compaction",
     "codex",
     "responses"
@@ -32,6 +33,7 @@
   },
   "files": [
     "index.ts",
+    "src/anthropic-compaction.ts",
     "src/compact-client.ts",
     "src/compact-client-v2.ts",
     "src/config.ts",
