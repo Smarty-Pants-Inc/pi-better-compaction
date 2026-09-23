@@ -3,7 +3,8 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 
 describe("pi smoke", () => {
-	test(
+	// Needs an installed pi with a working model, so hosted CI skips it.
+	test.skipIf(Boolean(process.env.CI))(
 		"loads from the local package path",
 		() => {
 			const packageDir = path.resolve(import.meta.dir, "..");

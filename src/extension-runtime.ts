@@ -5,6 +5,7 @@ import type {
 	ExtensionContext,
 	SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { executeNativeCompaction } from "./compact-client";
 import { executeV2Compaction } from "./compact-client-v2";
 import { loadExtensionConfig } from "./config";
@@ -89,6 +90,12 @@ function getSessionId(ctx: ExtensionContext): string | undefined {
 	}
 }
 
+// The live session manager has buildSessionContext(); Pi's read-only extension type omits it.
+function buildSessionMessages(ctx: ExtensionContext): AgentMessage[] {
+	return (ctx.sessionManager as unknown as { buildSessionContext(): { messages: AgentMessage[] } })
+		.buildSessionContext().messages;
+}
+
 function notifyWarning(ctx: ExtensionContext, message: string): void {
 	if (ctx.hasUI) {
 		ctx.ui.notify(`${EXTENSION_ID}: ${message}`, "warning");
@@ -147,7 +154,7 @@ async function runResponsesV1Compact(
 			latestNativeCompaction.reason === "no-compaction" ? "session-context" : "non-native-session-context";
 		request = serializeMessagesToCompactRequest({
 			model: runtime.currentModel,
-			messages: ctx.sessionManager.buildSessionContext().messages,
+			messages: buildSessionMessages(ctx),
 			instructions,
 		});
 	} else {
@@ -300,7 +307,7 @@ async function runResponsesV2Compact(
 			latestNativeCompaction.reason === "no-compaction" ? "session-context" : "non-native-session-context";
 		request = serializeMessagesToCompactRequest({
 			model: runtime.currentModel,
-			messages: ctx.sessionManager.buildSessionContext().messages,
+			messages: buildSessionMessages(ctx),
 			instructions,
 		});
 	} else {
@@ -583,6 +590,10 @@ async function handleBeforeProviderRequest(
 	}
 
 	const runtime = resolution.runtime;
+	const payload = runtime.payload;
+	if (!payload) {
+		return undefined;
+	}
 	const branchEntries = ctx.sessionManager.getBranch();
 	const latestNativeCompaction = resolveLatestNativeCompactionEntry(branchEntries, {
 		provider: runtime.provider,
@@ -614,7 +625,7 @@ async function handleBeforeProviderRequest(
 	const latestNativeCompactionEntry = latestNativeCompaction.entry;
 	const rewrite = rewriteResponsesPayloadWithNativeReplay({
 		model: runtime.currentModel,
-		payload: runtime.payload,
+		payload,
 		branchEntries,
 		compactionEntry: latestNativeCompactionEntry,
 	});
@@ -649,7 +660,7 @@ async function handleBeforeProviderRequest(
 			compactionEntryId: latestNativeCompactionEntry.id,
 			boundaryIndex: rewrite.segments.boundaryIndex,
 			firstKeptEntryIndex: rewrite.segments.firstKeptEntryIndex,
-			originalInputItems: runtime.payload.input.length,
+			originalInputItems: payload.input.length,
 			rewrittenInputItems: rewrite.rewrittenPayload.input.length,
 			freshPreambleItems: rewrite.segments.freshPreamble.length,
 			trailingPreambleItems: rewrite.segments.trailingPreamble.length,

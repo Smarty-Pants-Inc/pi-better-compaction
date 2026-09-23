@@ -52,6 +52,8 @@
     "LICENSE"
   ],
   "scripts": {
+    "check": "bun run typecheck && bun run test",
+    "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:coverage": "bun test --coverage --coverage-reporter=text --coverage-reporter=lcov && node ./scripts/check-lcov.mjs ./coverage/lcov.info",
     "test:pi": "bun test ./test/pi-smoke.test.ts"
@@ -60,5 +62,9 @@
     "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": ">=0.84.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
   }
 }

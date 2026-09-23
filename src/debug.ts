@@ -7,6 +7,7 @@ import {
 	REDACTED_VALUE,
 	type ArtifactContext,
 	type ArtifactPaths,
+	type ArtifactSessionInfo,
 	type DebugArtifactEnvelope,
 	type DebugArtifactKind,
 	type ExtensionConfig,
@@ -22,7 +23,7 @@ function ensureDir(dirPath: string) {
 	fs.mkdirSync(dirPath, { recursive: true });
 }
 
-function toSessionInfo(context: ArtifactContext) {
+function toSessionInfo(context: ArtifactContext): ArtifactSessionInfo {
 	const maybeExtensionContext = context as Pick<ExtensionContext, "cwd" | "sessionManager">;
 	const sessionManager = maybeExtensionContext.sessionManager;
 	if (sessionManager) {
@@ -33,7 +34,7 @@ function toSessionInfo(context: ArtifactContext) {
 			sessionDir: sessionManager.getSessionDir(),
 		};
 	}
-	return context;
+	return context as ArtifactSessionInfo;
 }
 
 function sanitizePathSegment(value: string | undefined, fallback: string): string {
