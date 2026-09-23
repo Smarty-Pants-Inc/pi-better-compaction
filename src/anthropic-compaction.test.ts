@@ -95,6 +95,38 @@ function piPayload(model = opus, summary = BLOCK.content) {
 	};
 }
 
+/** The error text Pi 0.87 recorded for the rejected block in the smarty-dev#251 proof. */
+const REJECTED_BLOCK_ERROR =
+	'400 {"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content.0: invalid `signature` in `compaction` block"}}';
+
+function rejectedTurn(errorMessage: string) {
+	return {
+		role: "assistant",
+		content: [],
+		api: "anthropic-messages",
+		provider: opus.provider,
+		model: opus.id,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+		stopReason: "error",
+		timestamp: 1790186756436,
+		errorMessage,
+	};
+}
+
+function turnEnd(errorMessage: string) {
+	return {
+		type: "turn_end",
+		turnIndex: 0,
+		message: rejectedTurn(errorMessage),
+		toolResults: [],
+		messageEntryId: "a1",
+		toolResultEntryIds: [],
+		outcome: "error",
+		entries: [],
+		continue: false,
+	};
+}
+
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
 function harness(anthropicResult: Record<string, unknown> = { ok: true, block: BLOCK, messageId: "msg_1" }) {
@@ -347,15 +379,66 @@ describe("runtime", () => {
 		expect(h.anthropicCalls[0]!.priorReplay).toBeUndefined();
 	});
 
-	test("a 400 on a replayed request retires the block; later requests keep Pi's summary", async () => {
+	test("a rejected block is retired at turn_end and the turn is resent once with Pi's summary", async () => {
 		const h = harness();
 		const branch: unknown[] = [userEntry("kept", "kept"), anthropicCompactionEntry("c1", "kept"), userEntry("u2", "next")];
 		expect(await h.call("before_provider_request", { payload: piPayload() }, h.context(opus, branch))).toBeDefined();
-		await h.call("after_provider_response", { status: 400, headers: {} }, h.context(opus, branch));
-		expect(h.appended).toEqual([{ customType: ANTHROPIC_BLOCK_REJECTED_ENTRY, data: { compactionEntryId: "c1" } }]);
 
-		branch.push({ type: "custom", id: "r1", customType: ANTHROPIC_BLOCK_REJECTED_ENTRY, data: { compactionEntryId: "c1" } });
+		// Pi 0.87 fires no after_provider_response for a 400; the failure arrives as an error turn.
+		branch.push({ type: "message", id: "a1", message: rejectedTurn(REJECTED_BLOCK_ERROR) });
+		const boundary = (await h.call("turn_end", turnEnd(REJECTED_BLOCK_ERROR), h.context(opus, branch))) as {
+			entries: Array<Record<string, unknown>>;
+		};
+		expect(boundary).toEqual({
+			entries: [
+				{ type: "custom", customType: ANTHROPIC_BLOCK_REJECTED_ENTRY, data: { compactionEntryId: "c1" } },
+				{ type: "context_edit", targetId: "a1", replacement: null },
+			],
+		});
+		branch.push(...boundary.entries.map((entry, index) => ({ ...entry, id: `b${index}` })));
+		expect(await h.call("agent_before_settle", {}, h.context(opus, branch))).toEqual({ continue: true });
+
+		// The resend replays Pi's summary, not the block.
 		expect(await h.call("before_provider_request", { payload: piPayload() }, h.context(opus, branch))).toBeUndefined();
+		// If the resend fails the same way, nothing retries again.
+		expect(await h.call("turn_end", turnEnd(REJECTED_BLOCK_ERROR), h.context(opus, branch))).toBeUndefined();
+		expect(await h.call("agent_before_settle", {}, h.context(opus, branch))).toBeUndefined();
+	});
+
+	test("on Pi without turn_end boundary results, the block is retired for the next prompt", async () => {
+		const h = harness();
+		const branch = [userEntry("kept", "kept"), anthropicCompactionEntry("c1", "kept"), userEntry("u2", "next")];
+		await h.call("before_provider_request", { payload: piPayload() }, h.context(opus, branch));
+		const { messageEntryId: _, ...olderTurnEnd } = turnEnd(REJECTED_BLOCK_ERROR);
+		expect(await h.call("turn_end", olderTurnEnd, h.context(opus, branch))).toBeUndefined();
+		expect(h.appended).toEqual([{ customType: ANTHROPIC_BLOCK_REJECTED_ENTRY, data: { compactionEntryId: "c1" } }]);
+		expect(await h.call("agent_before_settle", {}, h.context(opus, branch))).toBeUndefined();
+	});
+
+	test("rate limits, 5xx, other 400s and a bare 400 status keep the block", async () => {
+		const h = harness();
+		const branch = [userEntry("kept", "kept"), anthropicCompactionEntry("c1", "kept"), userEntry("u2", "next")];
+		const otherErrors = [
+			'429 {"type":"error","error":{"type":"rate_limit_error","message":"compaction block rate limited"}}',
+			'529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
+			'500 {"type":"error","error":{"type":"api_error","message":"invalid `compaction` block"}}',
+			'400 {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}',
+		];
+		for (const errorMessage of otherErrors) {
+			expect(await h.call("before_provider_request", { payload: piPayload() }, h.context(opus, branch))).toBeDefined();
+			expect(await h.call("turn_end", turnEnd(errorMessage), h.context(opus, branch))).toBeUndefined();
+		}
+
+		// A status without the error text never retires the block on its own.
+		await h.call("before_provider_request", { payload: piPayload() }, h.context(opus, branch));
+		await h.call("after_provider_response", { status: 400, headers: {} }, h.context(opus, branch));
+		expect(await h.call("turn_end", turnEnd(otherErrors[3]!), h.context(opus, branch))).toBeUndefined();
+		expect(await h.call("agent_before_settle", {}, h.context(opus, branch))).toBeUndefined();
+
+		// The rejection text on a request that did not carry the block is not ours.
+		expect(await h.call("before_provider_request", { payload: piPayload(sonnet) }, h.context(sonnet, branch))).toBeUndefined();
+		expect(await h.call("turn_end", turnEnd(REJECTED_BLOCK_ERROR), h.context(sonnet, branch))).toBeUndefined();
+		expect(h.appended).toHaveLength(0);
 	});
 
 	test("a 200 keeps the block, and a payload without Pi's summary first is left alone", async () => {
@@ -363,7 +446,7 @@ describe("runtime", () => {
 		const branch = [userEntry("kept", "kept"), anthropicCompactionEntry("c1", "kept")];
 		await h.call("before_provider_request", { payload: piPayload() }, h.context(opus, branch));
 		await h.call("after_provider_response", { status: 200, headers: {} }, h.context(opus, branch));
-		expect(h.appended).toHaveLength(0);
+		expect(await h.call("turn_end", turnEnd(REJECTED_BLOCK_ERROR), h.context(opus, branch))).toBeUndefined();
 		const other = piPayload(opus, "something else");
 		expect(await h.call("before_provider_request", { payload: other }, h.context(opus, branch))).toBeUndefined();
 	});

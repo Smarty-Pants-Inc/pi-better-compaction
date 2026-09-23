@@ -108,7 +108,7 @@ When pi triggers compaction (`session_before_compact`):
    - The response holds one signed `compaction` block. It is stored in the compaction entry's `details`, keyed by provider, API, model and base URL. Its text is also the entry summary.
    - Later requests for the same provider and model replace Pi's summary message with the block, verbatim, as the first message. Pi's kept messages stay unchanged.
    - After a switch to another provider or model, Pi's summary is sent instead. A block is never sent to a different provider or model.
-   - If the provider answers a request that carries the block with HTTP 400, the block is retired for the session and Pi's summary is used.
+   - If the provider rejects a request that carries the block with an HTTP 400 that names the `compaction` block (for example, `invalid signature in compaction block` after an account failover), the block is retired for the session. The failed reply is omitted from model context, and Pi resends the turn once with its own summary. Rate limits, 5xx errors and other 400s do not retire the block.
    - The compaction threshold stays in Pi's `compaction` settings.
 
 3. **Not a native API, or native compact failed** → if `compactionModel` is configured and differs from the current model, run pi's built-in `compact()` with that model.
