@@ -199,7 +199,9 @@ export function serializeMessagesToResponsesInput<TApi extends Api>(
 			continue;
 		}
 
-		input.push(serializeToolResultMessage(message, model));
+		if (message.role === "toolResult") {
+			input.push(serializeToolResultMessage(message, model));
+		}
 		messageIndex++;
 	}
 
@@ -272,7 +274,7 @@ function transformMessagesForResponses(messages: Message[]): Message[] {
 				continue;
 			}
 
-			const normalizedContent = message.content.flatMap((block) => {
+			const normalizedContent = message.content.flatMap((block): AssistantMessage["content"] => {
 				if (block.type !== "thinking") {
 					return [block];
 				}

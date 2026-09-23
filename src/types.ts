@@ -130,7 +130,7 @@ export type NativeCompactionDetails = NativeCompactionIdentity & {
 	requestMeta?: NativeCompactionRequestMeta;
 };
 
-export type NativeCompactionEntry = CompactionEntry<NativeCompactionDetails>;
+export type NativeCompactionEntry = CompactionEntry<NativeCompactionDetails> & { details: NativeCompactionDetails };
 
 export type CreateNativeCompactionDetailsInput = NativeCompactionIdentity & {
 	compactedWindow: unknown[];
@@ -253,7 +253,7 @@ export function isNativeCompactionDetails(value: unknown): value is NativeCompac
 
 	return (
 		(value.strategy === NATIVE_COMPACTION_STRATEGY || value.strategy === NATIVE_COMPACTION_STRATEGY_V2) &&
-		isNativeCompactionIdentity(value) &&
+		isNativeCompactionIdentity(value as unknown) &&
 		Array.isArray(value.compactedWindow) &&
 		value.compactedWindow.every(isCompactedWindowItem) &&
 		isNonEmptyString(value.createdAt) &&
