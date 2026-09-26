@@ -199,7 +199,17 @@ export function serializeMessagesToResponsesInput<TApi extends Api>(
 			continue;
 		}
 
-		input.push(serializeToolResultMessage(message, model));
+		if (message.role === "toolResult") {
+			input.push(serializeToolResultMessage(message, model));
+			messageIndex++;
+			continue;
+		}
+
+		// Pi session contexts can contain roles this serializer does not model
+		// (e.g. persisted `system` prompt messages whose `content` is a plain
+		// string). They carry no tool output, and the compact request already
+		// receives the system prompt via `instructions`, so skip them instead of
+		// mis-serializing them as tool results.
 		messageIndex++;
 	}
 
@@ -415,11 +425,12 @@ function serializeToolResultMessage<TApi extends Api>(
 	model: Model<TApi>,
 ): ResponsesFunctionCallOutputItem {
 	const [callId] = (message.toolCallId ?? "").split("|");
-	const textOutput = message.content
+	const contentItems = normalizeToolResultContent(message.content);
+	const textOutput = contentItems
 		.filter((item): item is TextContent => item.type === "text")
 		.map((item) => sanitizeSurrogates(item.text))
 		.join("\n");
-	const hasImages = message.content.some((item) => item.type === "image");
+	const hasImages = contentItems.some((item) => item.type === "image");
 	const hasText = textOutput.length > 0;
 
 	if (hasImages && model.input.includes("image")) {
@@ -427,7 +438,7 @@ function serializeToolResultMessage<TApi extends Api>(
 		if (hasText) {
 			output.push({ type: "input_text", text: textOutput });
 		}
-		for (const item of message.content) {
+		for (const item of contentItems) {
 			if (item.type !== "image") {
 				continue;
 			}
@@ -453,6 +464,26 @@ function serializeToolResultMessage<TApi extends Api>(
 
 function normalizeUserContent(content: UserMessage["content"]): Array<TextContent | ImageContent> {
 	return typeof content === "string" ? [{ type: "text", text: content }] : content;
+}
+
+/**
+ * Session files are parsed without validation and older Pi versions persisted
+ * tool results with string `content`, so normalize defensively instead of
+ * assuming an array (mirrors normalizeUserContent above).
+ */
+function normalizeToolResultContent(
+	content: ToolResultMessage["content"] | string | null | undefined,
+): Array<TextContent | ImageContent> {
+	if (typeof content === "string") {
+		return content.length > 0 ? [{ type: "text", text: content }] : [];
+	}
+	if (!Array.isArray(content)) {
+		return [];
+	}
+	return content.filter(
+		(item): item is TextContent | ImageContent =>
+			item != null && (item.type === "text" || item.type === "image"),
+	);
 }
 
 function parseReasoningItem(block: ThinkingContent): ResponsesReasoningItem | undefined {

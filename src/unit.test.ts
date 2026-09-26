@@ -140,6 +140,40 @@ test("serializer sanitizes unpaired surrogates in instructions and message conte
 	expect(JSON.stringify(inputOnly)).not.toContain("\\udc00");
 });
 
+test("serializer skips non-tool-result roles and normalizes non-array tool-result content", () => {
+	// Regression test for https://github.com/lll9p/pi-better-compaction/issues/6
+	// Pi >=0.86 persists the system prompt as a session message whose `content`
+	// is a plain string; the serializer must not route it into the tool-result
+	// branch, and tool results with legacy string/null content must not crash.
+	const input = serializeMessagesToResponsesInput(baseModel as never, [
+		{ role: "system", content: "persisted system prompt", timestamp: 1 },
+		{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: 2 },
+		{
+			role: "toolResult",
+			toolCallId: "call_1|fc_call_1",
+			toolName: "read",
+			isError: false,
+			content: "legacy string tool result",
+			timestamp: 3,
+		},
+		{
+			role: "toolResult",
+			toolCallId: "call_2|fc_call_2",
+			toolName: "read",
+			isError: false,
+			content: null,
+			timestamp: 4,
+		},
+	] as never);
+
+	const functionCallOutputs = input.filter(
+		(item) => (item as { type?: string }).type === "function_call_output",
+	);
+	expect(functionCallOutputs).toHaveLength(2);
+	expect(JSON.stringify(input)).not.toContain("persisted system prompt");
+	expect(JSON.stringify(input)).toContain("legacy string tool result");
+});
+
 test("extractCompactedSummaryText joins assistant output_text blocks and skips opaque items", () => {
 	expect(
 		extractCompactedSummaryText([
