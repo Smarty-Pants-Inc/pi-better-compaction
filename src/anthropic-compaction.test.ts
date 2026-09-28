@@ -447,6 +447,7 @@ describe("runtime", () => {
 		await h.call("before_provider_request", { payload: piPayload() }, h.context(opus, branch));
 		await h.call("after_provider_response", { status: 200, headers: {} }, h.context(opus, branch));
 		expect(await h.call("turn_end", turnEnd(REJECTED_BLOCK_ERROR), h.context(opus, branch))).toBeUndefined();
+		expect(h.appended).toHaveLength(0);
 		const other = piPayload(opus, "something else");
 		expect(await h.call("before_provider_request", { payload: other }, h.context(opus, branch))).toBeUndefined();
 	});
