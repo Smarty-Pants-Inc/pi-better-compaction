@@ -9,7 +9,6 @@
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { convertToLlm, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { resolveLatestNativeCompactionEntry } from "./details-store";
 import {
@@ -17,6 +16,8 @@ import {
 	type NativeCompactionEntry,
 	type NativeCompactionIdentity,
 } from "./types";
+
+type CompleteSimple = typeof import("@earendil-works/pi-ai/compat").completeSimple;
 
 export const ANTHROPIC_MESSAGES_API = "anthropic-messages";
 export const ANTHROPIC_COMPACTION_BETA = "compact-2026-09-04";
@@ -287,7 +288,7 @@ export type ExecuteAnthropicCompactionOptions = {
 	sessionId?: string;
 	signal?: AbortSignal;
 	/** Injectable for tests. */
-	complete?: typeof completeSimple;
+	complete?: CompleteSimple;
 };
 
 /**
@@ -298,7 +299,6 @@ export type ExecuteAnthropicCompactionOptions = {
 export async function executeAnthropicCompaction(
 	options: ExecuteAnthropicCompactionOptions,
 ): Promise<AnthropicCompactionResult> {
-	const complete = options.complete ?? completeSimple;
 	let captured: { status: number; body: string } | undefined;
 	const captureFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
 		const response = await fetch(input, init);
@@ -310,8 +310,9 @@ export async function executeAnthropicCompaction(
 		return new Response(body, { status: response.status, statusText: response.statusText, headers });
 	};
 
-	let result: Awaited<ReturnType<typeof completeSimple>>;
+	let result: Awaited<ReturnType<CompleteSimple>>;
 	try {
+		const complete = options.complete ?? (await import("@earendil-works/pi-ai/compat")).completeSimple;
 		result = await complete(
 			options.model,
 			{ systemPrompt: options.systemPrompt, messages: convertToLlm(options.messages) },
