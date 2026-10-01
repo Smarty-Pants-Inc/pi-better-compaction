@@ -10,15 +10,22 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: smarty-linux-x64
+    timeout-minutes: 20
     strategy:
       matrix:
         node-version: [22.19.0, 24]
 
     steps:
+      - name: Install Forge base prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl git unzip
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Reject unapproved hosted runners
+        run: bash scripts/ci/no-hosted-runners.sh
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
       - name: Setup Node.js
