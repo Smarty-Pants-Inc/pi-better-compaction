@@ -752,6 +752,59 @@ test("trailing provider-authored developer prompts survive native replay in plac
 	expect(rewritten.input[rewritten.input.length - 1]).toEqual(trailingPrompt);
 });
 
+for (const reasoning of [false, true]) {
+	for (const appendUser of [false, true]) {
+		test(`pi 1.0 appended mcp_servers system section survives native replay (${reasoning ? "developer" : "system"}, ${appendUser ? "interior" : "trailing"})`, async () => {
+			const { beforeProviderRequest } = await loadHookHarness();
+			const model = { ...defaultModel, reasoning };
+			const keptUser = createUserEntry("mcp_kept", "Old context to replace.");
+			const compactedWindow = [{ type: "compaction", encrypted_content: "mcp-checkpoint" }];
+			const compactionEntry = createCompactionEntry({
+				id: "mcp_compaction", firstKeptEntryId: keptUser.id, model, compactedWindow,
+			});
+			const tailUser = createUserEntry("mcp_tail", "Use the newly registered MCP server.");
+			const systemUpdate: TestSessionEntry = {
+				type: "message", id: "mcp_update", timestamp: nextTimestamp(),
+				message: { role: "system", content: "", sections: { mcp_servers: "Available MCP servers: docs" }, timestamp: Date.now() },
+			};
+			const followUp = createUserEntry("mcp_followup", "Search docs now.");
+			const branchEntries = [keptUser, compactionEntry, tailUser, systemUpdate, ...(appendUser ? [followUp] : [])];
+			const payload = await buildPiReplayPayload({
+				model, branchEntries, compactionEntry, instructions: "Current instructions", freshPreamble: "Current prompt",
+			});
+			// Author the provider item independently of our serializer: pi 1.0 renders
+			// a named section update at its transcript position, not as a new preamble.
+			const updateItem = {
+				role: reasoning ? "developer" : "system",
+				content: 'Updated system prompt section "mcp_servers":\n\nAvailable MCP servers: docs',
+			};
+			payload.input = [
+				payload.input[0],
+				...await serializeResponsesInput(model, [createCompactionSummaryMessage(compactionEntry), toReplayMessage(keptUser), toReplayMessage(tailUser)]),
+				updateItem,
+				...await serializeResponsesInput(model, appendUser ? [toReplayMessage(followUp)] : []),
+			];
+			const original = structuredClone(payload);
+			const rewritten = await beforeProviderRequest(
+				{ payload }, createContext({ branchEntries, model, systemPrompt: payload.instructions }),
+			) as { input: unknown[]; instructions: string };
+			expect(rewritten.input).toEqual([
+				payload.input[0], ...compactedWindow,
+				...await serializeResponsesInput(model, [toReplayMessage(tailUser)]), updateItem,
+				...await serializeResponsesInput(model, appendUser ? [toReplayMessage(followUp)] : []),
+			]);
+			expect(rewritten.instructions).toBe(payload.instructions);
+			expect(payload).toEqual(original);
+			const mismatchedPayload = structuredClone(payload);
+			const updateIndex = mismatchedPayload.input.findIndex((item) => JSON.stringify(item) === JSON.stringify(updateItem));
+			mismatchedPayload.input[updateIndex] = { ...updateItem, content: "Unrecorded instructions" };
+			expect(await beforeProviderRequest(
+				{ payload: mismatchedPayload }, createContext({ branchEntries, model, systemPrompt: payload.instructions }),
+			)).toBeUndefined();
+		});
+	}
+}
+
 test("multi-turn follow-up survives restart/resume while preserving tool/result pairing and assistant phases", async () => {
 	const model = { ...defaultModel };
 	const keptUser = createUserEntry("resume_kept_user", "Remember the earlier migration context.");

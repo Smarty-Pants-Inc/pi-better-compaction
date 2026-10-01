@@ -181,6 +181,33 @@ export function serializeMessagesToResponsesInput<TApi extends Api>(
 
 	let messageIndex = 0;
 	for (const message of transformedMessages) {
+		if (message.role === "system") {
+			// The leading persisted prompt is already supplied through instructions.
+			// Later system messages patch the transcript (pi 1.0 MCP sections).
+			if (messageIndex > 0) {
+				const parts = [typeof message.content === "string"
+					? message.content
+					: message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n")];
+				// Mirror pi 1.0 renderSystemMessageUpdate framing locally; older peers
+				// need not export that newly public helper.
+				for (const [name, value] of Object.entries(message.sections ?? {})) {
+					parts.push(value === null
+						? `Removed system prompt section "${name}".`
+						: `Updated system prompt section "${name}":\n\n${value}`);
+				}
+				const text = parts.filter((part) => part.length > 0).join("\n\n");
+				if (text.length > 0) {
+					input.push({
+						role: model.reasoning && !(model.compat && "supportsDeveloperRole" in model.compat && model.compat.supportsDeveloperRole === false)
+							? "developer" : "system",
+						content: sanitizeSurrogates(text),
+					});
+				}
+			}
+			messageIndex++;
+			continue;
+		}
+
 		if (message.role === "user") {
 			const item = serializeUserMessage(message, model);
 			if (item) {
@@ -205,11 +232,7 @@ export function serializeMessagesToResponsesInput<TApi extends Api>(
 			continue;
 		}
 
-		// Pi session contexts can contain roles this serializer does not model
-		// (e.g. persisted `system` prompt messages whose `content` is a plain
-		// string). They carry no tool output, and the compact request already
-		// receives the system prompt via `instructions`, so skip them instead of
-		// mis-serializing them as tool results.
+		// Unknown session roles carry no tool output; never serialize them as tool results.
 		messageIndex++;
 	}
 
