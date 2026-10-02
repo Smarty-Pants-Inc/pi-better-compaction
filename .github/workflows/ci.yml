@@ -10,17 +10,29 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: smarty-linux-x64
+    timeout-minutes: 20
     strategy:
       matrix:
         node-version: [22.19.0, 24]
 
     steps:
+      - name: Install Forge base prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl git unzip
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.0'
+      - name: Reject unapproved hosted runners
+        run: bash scripts/ci/no-hosted-runners.sh
+      - name: Test hosted-runner guard
+        run: bash scripts/ci/test-no-hosted-runners.sh
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
