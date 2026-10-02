@@ -9,6 +9,6 @@
 		"skipLibCheck": true,
 		"types": ["bun"]
 	},
-	"include": ["index.ts", "src/**/*.ts"],
+	"include": ["index.ts", "src/**/*.ts", "scripts/ci/*.ts"],
 	"exclude": ["src/**/*.test.ts"]
 }
