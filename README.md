@@ -149,7 +149,10 @@ absent flag (the Responses APIs' default), Pi folds updates into its authoritati
 prompt/instructions; replay preserves that fresh preamble instead of re-emitting
 the folded updates.
 
-Message normalization uses Pi's own exported provider transform. A system update
+Message normalization reuses Pi 1.0's provider transform as a vendored pure helper
+(with MIT attribution). Its npm subpath is not supplied by Pi's bundled extension
+loader, so the extension ships only that helper, not a second private Pi runtime;
+the supported peer range is unchanged. A system update
 between an assistant tool call and its results is held until actual (or, for an
 orphaned call, synthetic) results have been flushed, including at transcript end.
 It must not close a pending call early or create duplicate function-call outputs.
@@ -159,15 +162,20 @@ It must not close a pending call early or create duplicate function-call outputs
 ```bash
 bun run check
 bun test --coverage --coverage-reporter=text --coverage-reporter=lcov
-bun test test/pi-provider-regression.test.ts test/pi-cli-boundary.test.ts
+bun test test/pi-provider-regression.test.ts test/pi-cli-boundary.test.ts test/pi-installed-load.test.ts
 ```
 
 The provider regressions capture actual Pi 1.0 Responses and Codex payloads in
 isolated subprocesses, without the unit-test converter mock or network requests.
 They cover MCP updates before and between actual tool results, and a trailing
 update with an orphaned call, checking exact output accounting and strict replay.
-The Linux CLI boundary tests run the repo-local Pi 1.0 bundle in real PTYs with
-throwaway HOME directories, built-in MCP, two V2 compactions, and resume. A local
+The installed-package load regression copies the published Pi 1.0 CLI bundle and
+its external `jiti` dependency, without any host-provided peer copies. In offline
+RPC mode with an isolated HOME it checks a successful root-import control, a
+failing unsupported-subpath control, and successful loading of the actual package.
+The Linux CLI boundary tests run the repo-local Pi 1.0 bundle in real PTYs against
+isolated package copies without development `node_modules`, with throwaway HOME
+directories, built-in MCP, two V2 compactions, and resume. A local
 synthetic HTTP endpoint captures request bodies; this proves extension loading
 and replay up to the network boundary, **not** model-backed context retention.
 The pending-tool CLI scenario seeds a historical call/MCP-update/result sequence

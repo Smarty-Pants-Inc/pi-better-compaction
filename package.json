@@ -46,6 +46,7 @@
     "src/retained-messages.ts",
     "src/runtime.ts",
     "src/serializer.ts",
+    "src/transform-messages.ts",
     "src/shared-headers.ts",
     "src/supported-environment.ts",
     "src/types.ts",

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { compact, convertToLlm } from "@earendil-works/pi-coding-agent";
-import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
+import { transformMessages } from "./transform-messages";
 import type {
 	Api,
 	AssistantMessage,
@@ -29,10 +29,11 @@ type CompactionPreparation = Parameters<typeof compact>[0];
  * - we only need Pi's current supported message semantics (assistant phase,
  *   reasoning signatures, tool call/result pairing, image blocks)
  * - the Responses wire serializer stays narrow; message normalization and tool
- *   result accounting delegate to Pi's exported provider transform
+ *   result accounting reuse Pi's provider transform (vendored pure helper)
  *
- * Message normalization/tool pairing uses Pi's exported transformMessages(), not
- * a local implementation. The helpers below mirror the same-model Responses wire
+ * Message normalization/tool pairing reuses Pi 1.0's transformMessages() via a
+ * vendored pure helper: its npm subpath is not host-provided by Pi's extension
+ * loader. No private Pi runtime is bundled. The helpers below mirror Responses wire
  * rules closely so later tasks can compare their output against captured
  * before_provider_request payload artifacts.
  */
@@ -182,7 +183,7 @@ export function serializeMessagesToResponsesInput<TApi extends Api>(
 	const transcriptMessages = supportsMidConvoSystemMessages
 		? llmMessages
 		: llmMessages.filter((message) => message.role !== "system");
-	// Use the provider's own transform: system updates are held until pending
+	// Reuse the vendored provider transform: system updates are held until pending
 	// actual/synthetic tool results close, including the end-of-transcript flush.
 	// This serializer targets same-model replay, so no cross-provider ID adapter
 	// is needed (Pi invokes that adapter only for a different source model).

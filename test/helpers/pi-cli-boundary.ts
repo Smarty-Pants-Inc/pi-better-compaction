@@ -1,19 +1,18 @@
 import assert from "node:assert/strict";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, readFile, writeFile, appendFile, cp, rm } from "node:fs/promises";
+import { mkdir, readFile, writeFile, appendFile, cp, rm } from "node:fs/promises";
 import path from "node:path";
-import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-const packageDir = process.env.PI_COMPACTION_PACKAGE ?? repo;
 const capability = process.argv[2] ?? "absent";
 const pendingTool = process.argv[3] === "pending-tool";
 const cliExits: number[] = [];
 let pendingToolAccounting: ((payload: any) => void) | undefined;
-const root = await mkdtemp(path.join(process.env.TMPDIR ?? tmpdir(), "pbc-cli-"));
+const root = execFileSync("mktemp", ["-d"], { encoding: "utf8" }).trim();
+const packageDir = process.env.PI_COMPACTION_PACKAGE ?? path.join(root, "installed-package");
 const node = spawnSync("which", ["node"], { encoding: "utf8" }).stdout.trim();
 const cli = path.join(repo, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
 const eventsFile = path.join(root, "events.jsonl");
@@ -128,6 +127,12 @@ const shutdown = async () => {
 	cliExits.push(code!);
 };
 try {
+	if (!process.env.PI_COMPACTION_PACKAGE) {
+		const manifest = JSON.parse(await readFile(path.join(repo, "package.json"), "utf8"));
+		await mkdir(packageDir);
+		await writeFile(path.join(packageDir, "package.json"), JSON.stringify(manifest));
+		for (const file of manifest.files) await cp(path.join(repo, file), path.join(packageDir, file), { recursive: true });
+	}
 	await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
 	const port = (server.address() as any).port;
 	const agent = path.join(root, "home/.pi/agent");
