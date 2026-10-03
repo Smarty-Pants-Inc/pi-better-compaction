@@ -310,14 +310,15 @@ function isPromptEnvelopeItem(item: unknown): item is ResponsesInputMessageItem 
 
 export function extractFreshAuthoritativePreamble(
 	payload: ResponsesCompatibleRequestPayload,
+	historyInput: readonly ResponsesInputItem[] = [],
 ): FreshAuthoritativePreamble | undefined {
 	if (payload.instructions !== undefined && typeof payload.instructions !== "string") {
 		return undefined;
 	}
 
-	// Developer/system items in Pi's Responses payload are prompt-level instructions,
-	// not transcript entries from session history. Preserve them in the same leading
-	// or trailing position that Pi authored so provider-added suffix prompts like
+	// Leading/trailing developer/system envelopes surround the session transcript.
+	// Preserve them in the same position Pi authored, while leaving transcript
+	// section updates in history, so provider-added suffix prompts like
 	// GPT-5's trailing developer "# Juice: 0 !important" survive replay unchanged.
 	let leadingBoundary = 0;
 	while (leadingBoundary < payload.input.length && isPromptEnvelopeItem(payload.input[leadingBoundary])) {
@@ -329,11 +330,15 @@ export function extractFreshAuthoritativePreamble(
 		trailingBoundary -= 1;
 	}
 
-	for (let index = leadingBoundary; index < trailingBoundary; index++) {
-		if (isPromptEnvelopeItem(payload.input[index])) {
-			return undefined;
-		}
+	// A transcript can itself end in a system update. Keep that suffix inside
+	// history rather than mistaking it for a provider-authored trailing prompt.
+	let historyTrailingCount = 0;
+	for (let index = historyInput.length - 1; index >= 0 && isPromptEnvelopeItem(historyInput[index]); index--) {
+		historyTrailingCount++;
 	}
+	trailingBoundary = Math.min(payload.input.length, trailingBoundary + historyTrailingCount);
+	// Interior system/developer items are validated against serialized session
+	// history by the parity gate, not accepted as arbitrary prompt envelopes.
 
 	return {
 		...(typeof payload.instructions === "string" ? { instructions: payload.instructions } : {}),
@@ -444,14 +449,6 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 		};
 	}
 
-	const freshPreamble = extractFreshAuthoritativePreamble(args.payload);
-	if (!freshPreamble) {
-		return {
-			ok: false,
-			reason: "unsupported-instructions",
-		};
-	}
-
 	const newerCompactionEntry = args.branchEntries
 		.slice(boundaryIndex + 1)
 		.some((entry) => entry.type === "compaction");
@@ -470,7 +467,12 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 		};
 	}
 
-	const preCompactionEntries = args.branchEntries.slice(firstKeptEntryIndex, boundaryIndex);
+	// Pi 1.0 checkpoints the effective system state in CompactionEntry.systemMessage.
+	// Its buildContextEntries() drops retained system deltas before the boundary;
+	// replaying them again would both duplicate the checkpoint and fail parity.
+	// Filter the entries themselves so replay metadata and slice counts agree.
+	const preCompactionEntries = args.branchEntries.slice(firstKeptEntryIndex, boundaryIndex)
+		.filter((entry) => !(entry.type === "message" && entry.message.role === "system"));
 	const postCompactionEntries = args.branchEntries.slice(boundaryIndex + 1);
 	const preCompactionKeptMessages = collectReplayMessages(preCompactionEntries);
 	const postCompactionTailMessages = collectReplayMessages(postCompactionEntries);
@@ -480,6 +482,10 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 		...preCompactionKeptMessages,
 		...postCompactionTailMessages,
 	]);
+	const freshPreamble = extractFreshAuthoritativePreamble(args.payload, serializedPiHistoryInput);
+	if (!freshPreamble) {
+		return { ok: false, reason: "unsupported-instructions" };
+	}
 	const originalPiReplayInput: ResponsesInputItem[] = [
 		...freshPreamble.leadingInput,
 		...serializedPiHistoryInput,
