@@ -756,7 +756,7 @@ for (const reasoning of [false, true]) {
 	for (const appendUser of [false, true]) {
 		test(`pi 1.0 appended mcp_servers system section survives native replay (${reasoning ? "developer" : "system"}, ${appendUser ? "interior" : "trailing"})`, async () => {
 			const { beforeProviderRequest } = await loadHookHarness();
-			const model = { ...defaultModel, reasoning };
+			const model = { ...defaultModel, reasoning, compat: { supportsMidConvoSystemMessages: true } };
 			const keptUser = createUserEntry("mcp_kept", "Old context to replace.");
 			const compactedWindow = [{ type: "compaction", encrypted_content: "mcp-checkpoint" }];
 			const compactionEntry = createCompactionEntry({

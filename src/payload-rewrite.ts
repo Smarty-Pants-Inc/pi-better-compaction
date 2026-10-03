@@ -467,7 +467,12 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 		};
 	}
 
-	const preCompactionEntries = args.branchEntries.slice(firstKeptEntryIndex, boundaryIndex);
+	// Pi 1.0 checkpoints the effective system state in CompactionEntry.systemMessage.
+	// Its buildContextEntries() drops retained system deltas before the boundary;
+	// replaying them again would both duplicate the checkpoint and fail parity.
+	// Filter the entries themselves so replay metadata and slice counts agree.
+	const preCompactionEntries = args.branchEntries.slice(firstKeptEntryIndex, boundaryIndex)
+		.filter((entry) => !(entry.type === "message" && entry.message.role === "system"));
 	const postCompactionEntries = args.branchEntries.slice(boundaryIndex + 1);
 	const preCompactionKeptMessages = collectReplayMessages(preCompactionEntries);
 	const postCompactionTailMessages = collectReplayMessages(postCompactionEntries);

@@ -169,7 +169,18 @@ export function serializeMessagesToResponsesInput<TApi extends Api>(
 	options: SerializeResponsesMessagesOptions = {},
 ): ResponsesInputItem[] {
 	const llmMessages = convertToLlm(messages);
-	const transformedMessages = transformMessagesForResponses(llmMessages);
+	// Both Pi Responses providers default supportsMidConvoSystemMessages to false.
+	// In that mode they collapse every system delta into the authoritative leading
+	// prompt/instructions and remove it from conversation input *before* message
+	// transformation. Our caller already supplies that fresh provider-authored
+	// preamble (or ctx.getSystemPrompt() for compact requests), so do not rebuild it
+	// from potentially stale persisted text or emit those folded deltas again.
+	const supportsMidConvoSystemMessages = model.compat && "supportsMidConvoSystemMessages" in model.compat
+		&& model.compat.supportsMidConvoSystemMessages === true;
+	const transcriptMessages = supportsMidConvoSystemMessages
+		? llmMessages
+		: llmMessages.filter((message) => message.role !== "system");
+	const transformedMessages = transformMessagesForResponses(transcriptMessages);
 	const input: ResponsesInputItem[] = [];
 
 	if (options.includeInstructionsInInput && options.instructions) {

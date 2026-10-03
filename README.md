@@ -138,12 +138,33 @@ Then `/reload`, run `/compact`, send a follow-up message, and inspect:
 └── lifecycle/
 ```
 
+## Pi 1.0 system checkpoints
+
+Pi stores the effective prompt in `CompactionEntry.systemMessage` and excludes
+system updates from the retained pre-compaction range. Native replay follows that
+same filtering, while keeping strict parity checks on the provider transcript.
+Updates after the checkpoint remain in conversation input only when the model's
+`compat.supportsMidConvoSystemMessages` is explicitly `true`. With `false` or an
+absent flag (the Responses APIs' default), Pi folds updates into its authoritative
+prompt/instructions; replay preserves that fresh preamble instead of re-emitting
+the folded updates.
+
 ## Tests
 
 ```bash
-bun test
+bun run check
 bun test --coverage --coverage-reporter=text --coverage-reporter=lcov
+bun test test/pi-provider-regression.test.ts test/pi-cli-boundary.test.ts
 ```
+
+The provider regressions capture actual Pi 1.0 Responses and Codex payloads in
+isolated subprocesses, without the unit-test converter mock or network requests.
+The Linux CLI boundary tests run the repo-local Pi 1.0 bundle in real PTYs with
+throwaway HOME directories, built-in MCP, two V2 compactions, and resume. A local
+synthetic HTTP endpoint captures request bodies; this proves extension loading
+and replay up to the network boundary, **not** model-backed context retention.
+The separate `test:pi` working-model smoke is skipped under `CI=1`; a coordinated
+Pi installation still needs a working-model smoke before release acceptance.
 
 ## License
 
