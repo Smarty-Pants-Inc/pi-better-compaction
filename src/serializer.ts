@@ -1,15 +1,14 @@
 import { createHash } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { compact, convertToLlm } from "@earendil-works/pi-coding-agent";
+import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import type {
 	Api,
 	AssistantMessage,
 	ImageContent,
-	Message,
 	Model,
 	TextContent,
 	ThinkingContent,
-	ToolCall,
 	ToolResultMessage,
 	UserMessage,
 } from "@earendil-works/pi-ai";
@@ -23,16 +22,17 @@ import type { ResponsesCompatibleRequestPayload } from "./runtime";
 type CompactionPreparation = Parameters<typeof compact>[0];
 
 /**
- * Decision for T4: keep a narrow local serializer instead of importing Pi internals.
+ * Decision for T4: keep a narrow local Responses wire serializer.
  *
  * Why this is sufficient for v1:
  * - we only target same-model OpenAI Responses-compatible requests
  * - we only need Pi's current supported message semantics (assistant phase,
  *   reasoning signatures, tool call/result pairing, image blocks)
- * - Pi's shared Responses converter is not publicly exported, so importing it
- *   would require a brittle install-path-specific wrapper
+ * - the Responses wire serializer stays narrow; message normalization and tool
+ *   result accounting delegate to Pi's exported provider transform
  *
- * The helpers below intentionally mirror Pi's same-model Responses serialization
+ * Message normalization/tool pairing uses Pi's exported transformMessages(), not
+ * a local implementation. The helpers below mirror the same-model Responses wire
  * rules closely so later tasks can compare their output against captured
  * before_provider_request payload artifacts.
  */
@@ -129,8 +129,6 @@ type ParsedTextSignature = {
 	phase?: AssistantPhase;
 };
 
-const SYNTHETIC_TOOL_RESULT_TEXT = "No result provided";
-
 function sanitizeSurrogates(text: string): string {
 	return text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "");
 }
@@ -168,7 +166,11 @@ export function serializeMessagesToResponsesInput<TApi extends Api>(
 	messages: AgentMessage[],
 	options: SerializeResponsesMessagesOptions = {},
 ): ResponsesInputItem[] {
-	const llmMessages = convertToLlm(messages);
+	// Retain our legacy session-file boundary guard: Pi's provider transform
+	// expects typed block arrays before it downgrades unsupported tool images.
+	const llmMessages = convertToLlm(messages).map((message) => message.role === "toolResult"
+		? { ...message, content: normalizeToolResultContent(message.content) }
+		: message);
 	// Both Pi Responses providers default supportsMidConvoSystemMessages to false.
 	// In that mode they collapse every system delta into the authoritative leading
 	// prompt/instructions and remove it from conversation input *before* message
@@ -180,7 +182,11 @@ export function serializeMessagesToResponsesInput<TApi extends Api>(
 	const transcriptMessages = supportsMidConvoSystemMessages
 		? llmMessages
 		: llmMessages.filter((message) => message.role !== "system");
-	const transformedMessages = transformMessagesForResponses(transcriptMessages);
+	// Use the provider's own transform: system updates are held until pending
+	// actual/synthetic tool results close, including the end-of-transcript flush.
+	// This serializer targets same-model replay, so no cross-provider ID adapter
+	// is needed (Pi invokes that adapter only for a different source model).
+	const transformedMessages = transformMessages(transcriptMessages, model);
 	const input: ResponsesInputItem[] = [];
 
 	if (options.includeInstructionsInInput && options.instructions) {
@@ -297,87 +303,6 @@ export function compareCompactRequestToPayload(
 		expected: parity.expected,
 		mismatches,
 	};
-}
-
-function transformMessagesForResponses(messages: Message[]): Message[] {
-	const transformed: Message[] = [];
-	let pendingToolCalls: ToolCall[] = [];
-	let existingToolResultIds = new Set<string>();
-
-	for (const message of messages) {
-		if (message.role === "assistant") {
-			if (pendingToolCalls.length > 0) {
-				transformed.push(...createSyntheticToolResults(pendingToolCalls, existingToolResultIds));
-				pendingToolCalls = [];
-				existingToolResultIds = new Set<string>();
-			}
-
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				continue;
-			}
-
-			const normalizedContent = message.content.flatMap((block): AssistantMessage["content"] => {
-				if (block.type !== "thinking") {
-					return [block];
-				}
-
-				return block.thinkingSignature ? [block] : [];
-			});
-
-			const normalizedAssistantMessage: AssistantMessage = {
-				...message,
-				content: normalizedContent,
-			};
-			transformed.push(normalizedAssistantMessage);
-
-			const toolCalls = normalizedContent.filter(isToolCallBlock);
-			if (toolCalls.length > 0) {
-				pendingToolCalls = toolCalls;
-				existingToolResultIds = new Set<string>();
-			}
-			continue;
-		}
-
-		if (message.role === "toolResult") {
-			existingToolResultIds.add(message.toolCallId);
-			transformed.push(message);
-			continue;
-		}
-
-		if (pendingToolCalls.length > 0) {
-			transformed.push(...createSyntheticToolResults(pendingToolCalls, existingToolResultIds));
-			pendingToolCalls = [];
-			existingToolResultIds = new Set<string>();
-		}
-
-		transformed.push(message);
-	}
-
-	return transformed;
-}
-
-function createSyntheticToolResults(
-	pendingToolCalls: readonly ToolCall[],
-	existingToolResultIds: ReadonlySet<string>,
-): ToolResultMessage[] {
-	const syntheticResults: ToolResultMessage[] = [];
-
-	for (const toolCall of pendingToolCalls) {
-		if (existingToolResultIds.has(toolCall.id)) {
-			continue;
-		}
-
-		syntheticResults.push({
-			role: "toolResult",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			content: [{ type: "text", text: SYNTHETIC_TOOL_RESULT_TEXT }],
-			isError: true,
-			timestamp: Date.now(),
-		});
-	}
-
-	return syntheticResults;
 }
 
 function serializeUserMessage<TApi extends Api>(
@@ -578,10 +503,6 @@ function normalizeAssistantMessageId(id: string | undefined, messageIndex: numbe
 	}
 
 	return `msg_${createHash("sha1").update(id).digest("hex").slice(0, 12)}`;
-}
-
-function isToolCallBlock(block: AssistantMessage["content"][number]): block is ToolCall {
-	return block.type === "toolCall";
 }
 
 function describeResponsesInputItem(item: unknown): string {

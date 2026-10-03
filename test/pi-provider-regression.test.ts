@@ -6,7 +6,7 @@ import path from "node:path";
 // The child executes an ordinary TS program, not bun:test, so it runs actual Pi.
 for (const api of ["openai-responses", "openai-codex-responses"]) {
 	for (const capability of ["true", "false", "absent"]) {
-		for (const placement of ["before", "interior", "trailing"]) {
+		for (const placement of ["before", "interior", "trailing", "tools-before-results", "tools-between-results", "tools-trailing-orphan"]) {
 			for (const reasoning of [false, true]) {
 				test(`real Pi provider replay: ${api} capability=${capability} update=${placement} reasoning=${reasoning}`, () => {
 					const result = spawnSync(process.execPath, [path.join(import.meta.dir, "helpers/pi-provider-probe.ts"), api, capability, placement, String(reasoning)], {

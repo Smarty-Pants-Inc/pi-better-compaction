@@ -33,8 +33,28 @@ const opaque = [{ type: "compaction", encrypted_content: "opaque-test-checkpoint
 const compactionId = session.appendCompaction(NATIVE_COMPACTION_FALLBACK_SUMMARY, keptId, 256,
 	createNativeCompactionDetails({ provider: model.provider, api: model.api, model: model.id, baseUrl: model.baseUrl, compactedWindow: opaque }), true);
 session.appendMessage(user("LIVE_TAIL"));
-if (placement !== "before") update();
-if (placement === "interior") session.appendMessage(user("FOLLOW_UP"));
+if (placement.startsWith("tools-")) {
+	const calls = ["A", "B"].map(name => ({ type: "toolCall" as const, id: `call_${name}|fc_${name}`, name: `lookup_${name}`, arguments: {} }));
+	session.appendMessage({
+		role: "assistant", content: calls, provider: model.provider, api: model.api, model: model.id,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "toolUse", timestamp: Date.now(),
+	});
+	const result = (index: number) => session.appendMessage({
+		role: "toolResult", toolCallId: calls[index].id, toolName: calls[index].name,
+		content: [{ type: "text", text: `ACTUAL_RESULT_${index === 0 ? "A" : "B"}` }], isError: false, timestamp: Date.now(),
+	});
+	if (placement === "tools-before-results") update();
+	result(0);
+	if (placement !== "tools-before-results") update();
+	if (placement !== "tools-trailing-orphan") {
+		result(1);
+		session.appendMessage(user("FOLLOW_UP"));
+	}
+} else {
+	if (placement !== "before") update();
+	if (placement === "interior") session.appendMessage(user("FOLLOW_UP"));
+}
 const branchEntries = session.getBranch();
 const compactionEntry = branchEntries.find(e => e.id === compactionId)!;
 assert.equal(compactionEntry.type, "compaction");
@@ -58,6 +78,18 @@ const stream = (api === "openai-responses" ? responsesStream : codexStream)(mode
 await stream.result();
 assert.ok(payload, "Pi's real provider must reach onPayload");
 assert.equal(networkCalls, 0);
+if (placement.startsWith("tools-")) {
+	// These expectations describe independently produced Pi provider input, not
+	// the extension's transform. System updates must never duplicate outputs.
+	const outputs = payload.input.filter((item: any) => item.type === "function_call_output");
+	assert.deepEqual(outputs.map((item: any) => item.call_id), ["call_A", "call_B"]);
+	assert.deepEqual(outputs.map((item: any) => item.output), ["ACTUAL_RESULT_A", placement === "tools-trailing-orphan" ? "No result provided" : "ACTUAL_RESULT_B"]);
+	const lastResultIndex = payload.input.findLastIndex((item: any) => item.type === "function_call_output");
+	if (native) {
+		const updateIndex = payload.input.findIndex((item: any) => (item.role === "system" || item.role === "developer") && typeof item.content === "string" && item.content.includes("MCP registry changed."));
+		assert.equal(updateIndex, lastResultIndex + 1, "Pi holds the update until actual/synthetic tool results are flushed");
+	}
+}
 const original = structuredClone(payload);
 const args = { model, payload, branchEntries, compactionEntry: compactionEntry as never };
 const rewritten = rewriteResponsesPayloadWithNativeReplay(args);
@@ -100,4 +132,4 @@ const tampered = structuredClone(payload);
 tampered.input[liveTailIndex].content = [{ type: "input_text", text: "UNRECORDED_USER" }];
 assert.equal(rewriteResponsesPayloadWithNativeReplay({ ...args, payload: tampered }).ok, false, "strict parity gate rejects changed transcript");
 assert.equal(await handlers.get("before_provider_request")!({ payload: tampered }, ctx), undefined);
-console.log(JSON.stringify({ api, capability, placement, reasoning: model.reasoning, checkpoint: true, payloadCapturedFromRealProvider: true, networkCalls, parity: true, hook: true, strictTamperRejected: true }));
+console.log(JSON.stringify({ api, capability, placement, reasoning: model.reasoning, checkpoint: true, payloadCapturedFromRealProvider: true, networkCalls, parity: true, hook: true, strictTamperRejected: true, toolAccounting: placement.startsWith("tools-") }));

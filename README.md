@@ -149,6 +149,11 @@ absent flag (the Responses APIs' default), Pi folds updates into its authoritati
 prompt/instructions; replay preserves that fresh preamble instead of re-emitting
 the folded updates.
 
+Message normalization uses Pi's own exported provider transform. A system update
+between an assistant tool call and its results is held until actual (or, for an
+orphaned call, synthetic) results have been flushed, including at transcript end.
+It must not close a pending call early or create duplicate function-call outputs.
+
 ## Tests
 
 ```bash
@@ -159,10 +164,16 @@ bun test test/pi-provider-regression.test.ts test/pi-cli-boundary.test.ts
 
 The provider regressions capture actual Pi 1.0 Responses and Codex payloads in
 isolated subprocesses, without the unit-test converter mock or network requests.
+They cover MCP updates before and between actual tool results, and a trailing
+update with an orphaned call, checking exact output accounting and strict replay.
 The Linux CLI boundary tests run the repo-local Pi 1.0 bundle in real PTYs with
 throwaway HOME directories, built-in MCP, two V2 compactions, and resume. A local
 synthetic HTTP endpoint captures request bodies; this proves extension loading
 and replay up to the network boundary, **not** model-backed context retention.
+The pending-tool CLI scenario seeds a historical call/MCP-update/result sequence
+using Pi's native session append APIs only while the CLI is stopped, reusing a
+builtin-MCP-authored system patch. It verifies real resumed CLI replay and the
+next compact request; it is not proof of a live MCP update racing tool execution.
 The separate `test:pi` working-model smoke is skipped under `CI=1`; a coordinated
 Pi installation still needs a working-model smoke before release acceptance.
 

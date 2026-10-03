@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtemp, mkdir, readFile, writeFile, appendFile, cp, rm } from "node:fs/promises";
@@ -9,6 +10,9 @@ import { fileURLToPath } from "node:url";
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const packageDir = process.env.PI_COMPACTION_PACKAGE ?? repo;
 const capability = process.argv[2] ?? "absent";
+const pendingTool = process.argv[3] === "pending-tool";
+const cliExits: number[] = [];
+let pendingToolAccounting: ((payload: any) => void) | undefined;
 const root = await mkdtemp(path.join(process.env.TMPDIR ?? tmpdir(), "pbc-cli-"));
 const node = spawnSync("which", ["node"], { encoding: "utf8" }).stdout.trim();
 const cli = path.join(repo, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
@@ -119,7 +123,9 @@ const assertReplay = (payload: any, n: number) => {
 };
 const shutdown = async () => {
 	await send("/boundary-exit");
-	assert.equal(await exited, 0, "real CLI/PTY process must exit successfully");
+	const code = await exited;
+	assert.equal(code, 0, "real CLI/PTY process must exit successfully");
+	cliExits.push(code!);
 };
 try {
 	await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -154,7 +160,43 @@ try {
 	assertReplay(changed, 1);
 	if (capability !== "true") assert.ok(JSON.stringify(changed.input[0]).includes("LOCAL_MCP_DESCRIPTION_v2"), "collapsed fresh prompt must include current MCP state");
 	else assert.ok(changed.input.slice(1).some((i: any) => (i.role === "system" || i.role === "developer") && JSON.stringify(i).includes("LOCAL_MCP_DESCRIPTION_v2")), "native provider keeps MCP delta in transcript");
+	if (pendingTool) {
+		// Pi's builtin MCP patches are normally persisted at request boundaries.
+		// Seed this historical interleaving through native append APIs while the
+		// CLI is stopped (one session writer); never edit JSONL or fabricate an
+		// MCP patch. Resume then exercises the actual PTY/provider/hook path.
+		await shutdown();
+		const events = await records();
+		const sessionFile = events.filter(e => e.event === "exit").at(-1).data.sessionFile;
+		const branch = events.filter(e => e.event === "settled").at(-1).data.branch;
+		const mcpPatch = branch.findLast((e: any) => e.message?.role === "system" && e.message.sections?.mcp_servers?.includes("LOCAL_MCP_DESCRIPTION_v2"))?.message;
+		assert.ok(mcpPatch, "seed must use a genuine builtin MCP system delta");
+		const session = SessionManager.open(sessionFile);
+		session.appendMessage({ role: "user", content: "PENDING_TOOL_FIXTURE", timestamp: Date.now() });
+		session.appendMessage({
+			role: "assistant", content: [{ type: "toolCall", id: "call_pending|fc_pending", name: "boundary_lookup", arguments: {} }],
+			provider: "local-boundary", api: "openai-responses", model: "pi-boundary", stopReason: "toolUse", timestamp: Date.now(),
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		});
+		session.appendMessage({ ...mcpPatch, timestamp: Date.now() });
+		session.appendMessage({ role: "toolResult", toolCallId: "call_pending|fc_pending", toolName: "boundary_lookup", content: [{ type: "text", text: "ACTUAL_PENDING_RESULT" }], isError: false, timestamp: Date.now() });
+		await writeFile(path.join(root, "pending-tool-seeded-branch.json"), JSON.stringify(session.getBranch(), null, 2));
+		await launch(sessionFile);
+		await mcp("v2");
+		const pending = await prompt("AFTER_PENDING_TOOL_RESUME");
+		assertReplay(pending, 1);
+		const assertToolAccounting = (payload: any) => {
+			const outputs = payload.input.filter((i: any) => i.type === "function_call_output" && i.call_id === "call_pending");
+			assert.deepEqual(outputs, [{ type: "function_call_output", call_id: "call_pending", output: "ACTUAL_PENDING_RESULT" }]);
+			const resultIndex = payload.input.indexOf(outputs[0]);
+			assert.ok(JSON.stringify(payload.input[resultIndex + 1]).includes("LOCAL_MCP_DESCRIPTION_v2"), "held MCP delta must follow the actual tool result");
+		};
+		assertToolAccounting(pending);
+		// Keep this callback for the subsequent native compact request, too.
+		pendingToolAccounting = assertToolAccounting;
+	}
 	const secondBranch = await compact();
+	if (pendingTool) pendingToolAccounting!(wire.filter(e => e.compact).at(-1).payload);
 	assert.ok(secondBranch.at(-1).systemMessage.sections.mcp_servers.includes("LOCAL_MCP_DESCRIPTION_v2"));
 	assertReplay(await prompt("AFTER_SECOND_COMPACTION"), 2);
 	await shutdown();
@@ -166,7 +208,7 @@ try {
 	assert.equal(compactCount, 2);
 	const version = spawnSync(node, [cli, "--version"], { encoding: "utf8" }).stdout.trim();
 	assert.equal(version, "1.0.0");
-	const summary = { version, capability, realPTY: true, packageLoaded: true, builtinMcp: true, compactions: compactCount, requestsCapturedAtLocalHttpBoundary: requestIndex, checkpointReplay: true, changedMcpReplay: true, secondCompactionReplay: true, resumeReplay: true, cliExits: [0, 0], modelBacked: false };
+	const summary = { version, capability, realPTY: true, packageLoaded: true, builtinMcp: true, compactions: compactCount, requestsCapturedAtLocalHttpBoundary: requestIndex, checkpointReplay: true, changedMcpReplay: true, secondCompactionReplay: true, resumeReplay: true, cliExits, pendingToolReplay: pendingTool, pendingToolFixture: pendingTool ? "native-session-append-while-cli-stopped" : undefined, modelBacked: false };
 	await writeFile(path.join(root, "summary.json"), JSON.stringify(summary, null, 2));
 	console.log(JSON.stringify(summary));
 } catch (error) { fatal = error; console.error(error); process.exitCode = 1; }
