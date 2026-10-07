@@ -1,6 +1,6 @@
 {
   "name": "@lll9p/pi-better-compaction",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "type": "module",
   "description": "Better compaction for pi: native /responses/compact replay for OpenAI Responses APIs, Anthropic server-side compaction, plus a configurable compaction model driving pi's native summarization everywhere else.",
   "author": "Lilin Lao",
