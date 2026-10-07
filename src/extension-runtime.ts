@@ -5,6 +5,8 @@ import type {
 	ExtensionContext,
 	SessionBeforeCompactEvent,
 	SessionEntry,
+	TurnEndEvent,
+	TurnEndEventResult,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
@@ -21,6 +23,14 @@ import {
 import { executeNativeCompaction } from "./compact-client";
 import { executeV2Compaction } from "./compact-client-v2";
 import { loadExtensionConfig } from "./config";
+import {
+	buildAffinitySafePayload,
+	COMPACTION_AFFINITY_RETIRED_ENTRY,
+	hasAffinitySafePlaintext,
+	isAffinityRetired,
+	isCompactionAffinityMissing,
+	resolveReplayableNativeCompaction,
+} from "./compaction-affinity";
 import { writeDebugArtifact } from "./debug";
 import { findLatestCompactionEntry, resolveLatestNativeCompactionEntry } from "./details-store";
 import { runNativeFallbackCompaction } from "./native-fallback";
@@ -75,6 +85,12 @@ type RuntimeState = {
 	resendAfterBlockRejection?: boolean;
 	/** `${compactionEntryId}|${provider}/${model}` pairs already warned about on model_select. */
 	warnedCheckpointSwitches?: Set<string>;
+	/** Compaction entry whose signed Responses item the in-flight request carries. */
+	pendingResponsesReplay?: string;
+	/** Set when a gateway 409 retired the compaction; the next settle resends once. */
+	resendAfterAffinityRecovery?: boolean;
+	/** At most one affinity recovery per user prompt. */
+	affinityRecoveryUsed?: boolean;
 };
 
 /**
@@ -204,7 +220,7 @@ async function runResponsesV1Compact(
 ): Promise<ResponsesCompactOutcome> {
 	const instructions = buildCompactionInstructions(ctx.getSystemPrompt(), event.customInstructions);
 	const branchEntries = ctx.sessionManager.getBranch();
-	const latestNativeCompaction = resolveLatestNativeCompactionEntry(branchEntries, {
+	const latestNativeCompaction = resolveReplayableNativeCompaction(branchEntries, {
 		provider: runtime.provider,
 		api: runtime.api,
 		model: runtime.model,
@@ -227,6 +243,8 @@ async function runResponsesV1Compact(
 		};
 	} else if (
 		latestNativeCompaction.reason === "no-compaction" ||
+		// The gateway cannot use the retired signed item; recompact from Pi's own context.
+		latestNativeCompaction.reason === "affinity-retired" ||
 		(latestNativeCompaction.reason === "latest-compaction-not-native" &&
 			config.allowCompactionContinuityBreak)
 	) {
@@ -357,7 +375,7 @@ async function runResponsesV2Compact(
 ): Promise<ResponsesCompactOutcome> {
 	const instructions = buildCompactionInstructions(ctx.getSystemPrompt(), event.customInstructions);
 	const branchEntries = ctx.sessionManager.getBranch();
-	const latestNativeCompaction = resolveLatestNativeCompactionEntry(branchEntries, {
+	const latestNativeCompaction = resolveReplayableNativeCompaction(branchEntries, {
 		provider: runtime.provider,
 		api: runtime.api,
 		model: runtime.model,
@@ -380,6 +398,8 @@ async function runResponsesV2Compact(
 		};
 	} else if (
 		latestNativeCompaction.reason === "no-compaction" ||
+		// The gateway cannot use the retired signed item; recompact from Pi's own context.
+		latestNativeCompaction.reason === "affinity-retired" ||
 		(latestNativeCompaction.reason === "latest-compaction-not-native" &&
 			config.allowCompactionContinuityBreak)
 	) {
@@ -817,6 +837,7 @@ async function handleBeforeProviderRequest(
 	}
 
 	state.pendingAnthropicReplay = undefined;
+	state.pendingResponsesReplay = undefined;
 	if (ctx.model?.api === ANTHROPIC_MESSAGES_API) {
 		return rewriteAnthropicRequest(event, ctx, config, state);
 	}
@@ -914,6 +935,24 @@ async function handleBeforeProviderRequest(
 		return undefined;
 	}
 
+	// The gateway rejected this compaction's signed item: never inject it again.
+	if (isAffinityRetired(branchEntries, latestNativeCompactionEntry.id)) {
+		const safePayload = buildAffinitySafePayload(payload, rewrite.segments, latestNativeCompactionEntry);
+		writeDebugArtifact(
+			"provider-request",
+			{
+				event: "before_provider_request.affinity-safe-replay",
+				compactionEntryId: latestNativeCompactionEntry.id,
+				rebuiltFromCompactedWindow: Boolean(safePayload),
+				payload: safePayload ?? payload,
+			},
+			config,
+			ctx,
+		);
+		return safePayload;
+	}
+	state.pendingResponsesReplay = latestNativeCompactionEntry.id;
+
 	writeDebugArtifact(
 		"provider-request",
 		{
@@ -941,6 +980,64 @@ async function handleBeforeProviderRequest(
 	);
 
 	return rewrite.rewrittenPayload;
+}
+
+function logAffinityRecovery(
+	ctx: ExtensionContext,
+	config: ExtensionConfig,
+	outcome: string,
+	level: "warning" | "error" = "warning",
+): void {
+	writeDebugArtifact("compaction-event", { event: "compaction-affinity-recovery", outcome }, config, ctx);
+	if (ctx.hasUI) {
+		ctx.ui.notify(`${EXTENSION_ID}: compaction-affinity-recovery: ${outcome}`, level);
+	}
+}
+
+/**
+ * The gateway answered 409 compaction_affinity_missing to a request that replayed a
+ * signed compaction item: retire that compaction for good and resend the model
+ * request once with plain-text context. The error turn ran no tools, so the resend
+ * re-executes none. One recovery per user prompt, so this cannot loop.
+ */
+function recoverCompactionAffinity(
+	pi: ExtensionAPI,
+	event: TurnEndEvent,
+	ctx: ExtensionContext,
+	compactionEntryId: string,
+	dependencies: ExtensionRuntimeDependencies,
+	state: RuntimeState,
+): TurnEndEventResult | undefined {
+	const { config } = dependencies.loadExtensionConfig();
+	if (state.affinityRecoveryUsed) {
+		logAffinityRecovery(ctx, config, "already-recovered (one recovery per turn; not retrying again)", "error");
+		return undefined;
+	}
+	state.affinityRecoveryUsed = true;
+
+	const retire = { type: "custom" as const, customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId } };
+	const entry = ctx.sessionManager.getBranch().find((candidate) => candidate.id === compactionEntryId);
+	if (!isNativeCompactionEntry(entry) || !hasAffinitySafePlaintext(entry)) {
+		if (!event.messageEntryId) pi.appendEntry(retire.customType, retire.data);
+		logAffinityRecovery(
+			ctx,
+			config,
+			"no-plaintext (the gateway rejected this session's native compaction and no plain-text context is kept; run /compact or start a new session)",
+			"error",
+		);
+		return event.messageEntryId ? { entries: [retire] } : undefined;
+	}
+	if (!event.messageEntryId) {
+		// Pi before 0.87 has no turn_end boundary results: retire now, the next prompt recovers.
+		pi.appendEntry(retire.customType, retire.data);
+		logAffinityRecovery(ctx, config, "retired (the next prompt replays plain-text context)");
+		return undefined;
+	}
+	state.resendAfterAffinityRecovery = true;
+	logAffinityRecovery(ctx, config, "retrying (compaction retired; resending once with plain-text context)");
+	return {
+		entries: [retire, { type: "context_edit", targetId: event.messageEntryId, replacement: null }],
+	};
 }
 
 export function registerExtensionRuntime(
@@ -987,6 +1084,7 @@ export function registerExtensionRuntime(
 	pi.on("before_provider_request", (event, ctx) => {
 		// Any new request, including a queued follow-up, already serves as the resend.
 		state.resendAfterBlockRejection = false;
+		state.resendAfterAffinityRecovery = false;
 		return handleBeforeProviderRequest(event, ctx, dependencies, state);
 	});
 	pi.on("after_provider_response", (event) => {
@@ -994,10 +1092,21 @@ export function registerExtensionRuntime(
 		// for turn_end and its error text. Pi 0.87 fires this hook only for 2xx
 		// Anthropic responses, because the SDK throws on an error status first.
 		if (event.status !== 400) state.pendingAnthropicReplay = undefined;
+		// Likewise, only the error text tells the gateway's affinity 409 from another one.
+		if (event.status !== 409) state.pendingResponsesReplay = undefined;
+	});
+	pi.on("before_agent_start", () => {
+		state.affinityRecoveryUsed = false;
+		return undefined;
 	});
 	pi.on("turn_end", (event, ctx) => {
+		const responsesReplay = state.pendingResponsesReplay;
+		state.pendingResponsesReplay = undefined;
 		const compactionEntryId = state.pendingAnthropicReplay;
 		state.pendingAnthropicReplay = undefined;
+		if (responsesReplay && isCompactionAffinityMissing(event.message)) {
+			return recoverCompactionAffinity(pi, event, ctx, responsesReplay, dependencies, state);
+		}
 		if (!compactionEntryId || !isAnthropicBlockRejection(event.message)) return undefined;
 		if (!event.messageEntryId) {
 			// ponytail: Pi before 0.87 has no turn_end boundary results, so record the
@@ -1021,8 +1130,9 @@ export function registerExtensionRuntime(
 	// resend happens at the settle boundary. The flag allows exactly one resend, and
 	// that request no longer carries the retired block, so it cannot loop.
 	pi.on("agent_before_settle", () => {
-		if (!state.resendAfterBlockRejection) return undefined;
+		if (!state.resendAfterBlockRejection && !state.resendAfterAffinityRecovery) return undefined;
 		state.resendAfterBlockRejection = false;
+		state.resendAfterAffinityRecovery = false;
 		return { continue: true };
 	});
 
