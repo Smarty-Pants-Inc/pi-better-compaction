@@ -102,9 +102,10 @@ function turnEnd(errorMessage: string, toolResultEntryIds: string[] = []) {
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
-function harness(recompact = true) {
+function harness(recompact = true, compactionVersion: "v1" | "v2" = "v2") {
 	const handlers = new Map<string, Handler>();
 	const notes: Array<{ text: string; level: string }> = [];
+	const v1Calls: unknown[] = [];
 	const v2Calls: Array<Record<string, any>> = [];
 	const toolExecutions: unknown[] = [];
 	/** ctx.abort() calls: a fail-closed request is aborted before the SDK sends it. */
@@ -117,8 +118,11 @@ function harness(recompact = true) {
 			},
 		} as never,
 		{
-			loadExtensionConfig: () => ({ config: { ...DEFAULT_EXTENSION_CONFIG }, warnings: [] }),
-			executeNativeCompaction: async () => ({ ok: false, reason: "network-error" }) as never,
+			loadExtensionConfig: () => ({ config: { ...DEFAULT_EXTENSION_CONFIG, compactionVersion }, warnings: [] }),
+			executeNativeCompaction: async (args) => {
+				v1Calls.push(args);
+				return { ok: false, reason: "network-error" } as never;
+			},
 			executeV2Compaction: async (args) => {
 				v2Calls.push(args as never);
 				return (recompact ? { ok: true, compactionItem: FRESH, responseId: "resp_fresh" } : { ok: false, reason: "network-error" }) as never;
@@ -144,7 +148,7 @@ function harness(recompact = true) {
 		},
 	});
 	const call = (name: string, event: unknown, branch: unknown[]) => handlers.get(name)?.(event, context(branch));
-	return { call, notes, v2Calls, toolExecutions, aborts };
+	return { call, notes, v1Calls, v2Calls, toolExecutions, aborts };
 }
 
 const hasSignedItem = (payload: unknown) =>
@@ -343,8 +347,10 @@ describe("compaction affinity recovery", () => {
 		const errors = h.notes.filter((note) => note.level === "error");
 		expect(errors).toHaveLength(1);
 		expect(errors[0]!.text).toContain("compaction-affinity-recovery: blocked");
-		expect(errors[0]!.text).toContain("/compact");
-		expect(errors[0]!.text).toContain("retry");
+		// /compact would compact c0's placeholder for good: point to /new or /tree instead.
+		expect(errors[0]!.text).not.toContain("/compact");
+		expect(errors[0]!.text).toContain("/new");
+		expect(errors[0]!.text).toContain("/tree");
 
 		// The next prompt fails closed too: the request is aborted, never Pi's placeholder payload.
 		commit(branch, boundary);
@@ -359,6 +365,48 @@ describe("compaction affinity recovery", () => {
 		expect(JSON.stringify(next)).not.toContain(NATIVE_COMPACTION_FALLBACK_SUMMARY);
 		expect(h.notes.filter((note) => note.level === "error")).toHaveLength(2);
 	});
+
+	for (const compactionVersion of ["v2", "v1"] as const) {
+		test(`consecutive ${compactionVersion}: /compact after the blocked 409 is cancelled, history untouched, no /compact advice`, async () => {
+			const h = harness(true, compactionVersion);
+			const branch: Array<Record<string, any>> = [
+				userEntry("u0", "Remember: the codename is HERON-7."),
+				assistantEntry("a0", "Noted. The cat is called Biscuit."),
+				userEntry("kept", "kept"),
+				compactionEntry("c0", [RETAINED, { ...SIGNED, id: "cmp_0", encrypted_content: "gAAAA-older-signed" }]),
+				userEntry("u1", "middle question"),
+				assistantEntry("a1", "Middle answer: the dog is called Juniper."),
+				{ ...compactionEntry("c1", [RETAINED, SIGNED]), firstKeptEntryId: "u1" },
+				userEntry("u2", "next question"),
+			];
+			await h.call("before_provider_request", { payload: piPayload(branch) }, branch);
+			branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
+			commit(branch, await h.call("turn_end", turnEnd(AFFINITY_409), branch));
+			const before = JSON.stringify(branch);
+
+			// The rebuilt context still holds c0's placeholder: compacting it would lose that history for good.
+			const result = await h.call(
+				"session_before_compact",
+				{
+					signal: new AbortController().signal,
+					preparation: { tokensBefore: 1, firstKeptEntryId: "u2", messagesToSummarize: [], turnPrefixMessages: [] },
+				},
+				branch,
+			);
+			expect(result).toEqual({ cancel: true });
+			expect(h.v1Calls).toHaveLength(0);
+			expect(h.v2Calls).toHaveLength(0);
+			expect(JSON.stringify(branch)).toBe(before);
+			const errors = h.notes.filter((note) => note.level === "error");
+			expect(errors).toHaveLength(2);
+			expect(errors[1]!.text).toContain("compaction cancelled");
+			for (const error of errors) {
+				expect(error.text).not.toContain("/compact");
+				expect(error.text).toContain("/new");
+				expect(error.text).toContain("/tree");
+			}
+		});
+	}
 
 	test("a retired v2 compaction without plain text and without a recognizable preamble fails closed, never Pi's payload", async () => {
 		const h = harness();

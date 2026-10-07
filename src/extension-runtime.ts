@@ -68,6 +68,7 @@ import {
 type ResponsesCompactOutcome =
 	| { outcome: "success"; compaction: CompactionResult<NativeCompactionDetails> }
 	| { outcome: "aborted" }
+	| { outcome: "blocked" }
 	| { outcome: "failed" };
 
 export type ExtensionRuntimeDependencies = {
@@ -229,6 +230,11 @@ async function runResponsesV1Compact(
 		baseUrl: runtime.baseUrl,
 	});
 
+	if (!latestNativeCompaction.ok && latestNativeCompaction.reason === "affinity-retired" && !isAffinityRebuildComplete(branchEntries)) {
+		// An earlier compaction is still in force with only a placeholder summary: compacting now would lose its history for good.
+		return { outcome: "blocked" };
+	}
+
 	let requestSource: "session-context" | "non-native-session-context" | "latest-native-replay";
 	let request: NativeCompactionRequestBody;
 	if (latestNativeCompaction.ok) {
@@ -386,6 +392,11 @@ async function runResponsesV2Compact(
 		model: runtime.model,
 		baseUrl: runtime.baseUrl,
 	});
+
+	if (!latestNativeCompaction.ok && latestNativeCompaction.reason === "affinity-retired" && !isAffinityRebuildComplete(branchEntries)) {
+		// An earlier compaction is still in force with only a placeholder summary: compacting now would lose its history for good.
+		return { outcome: "blocked" };
+	}
 
 	let requestSource: "session-context" | "non-native-session-context" | "latest-native-replay";
 	let request: NativeCompactionRequestBody;
@@ -722,6 +733,10 @@ async function handleSessionBeforeCompact(
 		if (responsesOutcome.outcome === "aborted") {
 			return { cancel: true };
 		}
+		if (responsesOutcome.outcome === "blocked") {
+			logAffinityRecovery(ctx, config, AFFINITY_COMPACT_BLOCKED, "error");
+			return { cancel: true };
+		}
 		// failed: fall through to the configured-model fallback below.
 	} else {
 		writeDebugArtifact(
@@ -936,7 +951,7 @@ async function handleBeforeProviderRequest(
 		);
 		if (!safe.ok) {
 			ctx.abort();
-			logAffinityRecovery(ctx, config, AFFINITY_BLOCKED, "error");
+			logAffinityRecovery(ctx, config, isAffinityRebuildComplete(branchEntries) ? AFFINITY_BLOCKED_NO_PREAMBLE : AFFINITY_BLOCKED, "error");
 		}
 		return safePayload;
 	}
@@ -998,7 +1013,12 @@ async function handleBeforeProviderRequest(
 	return rewrite.rewrittenPayload;
 }
 
-const AFFINITY_BLOCKED =
+// An earlier placeholder compaction is still in force: /compact would make its loss permanent.
+const AFFINITY_KEEP_HISTORY =
+	"to keep all history, start a new session with /new, or use /tree to return to a point before the earlier compaction";
+const AFFINITY_BLOCKED = `blocked (the context rebuilt without the retired compaction would drop compacted history; nothing was sent; ${AFFINITY_KEEP_HISTORY})`;
+const AFFINITY_COMPACT_BLOCKED = `compaction cancelled (an earlier compaction holds history only in a signed item the gateway rejected; compacting now would lose it for good; ${AFFINITY_KEEP_HISTORY})`;
+const AFFINITY_BLOCKED_NO_PREAMBLE =
 	"blocked (the context rebuilt without the retired compaction would drop compacted history; nothing was sent; run /compact or retry)";
 
 function logAffinityRecovery(
