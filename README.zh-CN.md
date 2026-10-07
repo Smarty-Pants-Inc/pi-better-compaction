@@ -103,6 +103,7 @@ pi 触发压缩时（`session_before_compact`）：
    - **V2**：向 `/responses` 端点发送携带 `compaction_trigger` 的流式请求，API 返回加密压缩 blob。保留的用户/开发者消息 + blob 组成压缩后的上下文。
    - **V1**：POST 到 `/responses/compact`，接收不透明的压缩窗口。
    - 成功后，压缩窗口被存储，后续请求通过 `before_provider_request` 钩子回放。
+   - 回放要求提供商、API 和模型与创建压缩窗口时一致。如果最近一次压缩只有占位摘要（V2 总是如此，V1 未提取到文本摘要时也如此），选择不兼容的模型会显示警告：该模型只能看到保留的消息，可通过 `/tree` 从第一次不兼容压缩之前的条目创建分支；只回到最近一次压缩之前，可能仍有更早的不透明检查点。当前会话内，每个压缩检查点与模型组合只提醒一次；有可读摘要时不提醒。此警告不比较配置中的基础 URL，避免 OAuth 动态解析端点造成误报。
 
 2. **Anthropic Messages API**（`anthropic-messages`）→ 使用 Pi 序列化的请求，将本次要丢弃的消息发送到服务端，携带 `compaction: {type: "summarize"}` 和 `compact-2026-09-04` beta：
    - 响应中的带签名 `compaction` 块存入压缩条目的 `details`，按提供商、API、模型和基础 URL 匹配。块中的文本同时作为 Pi 的摘要。
