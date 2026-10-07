@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { buildSessionContext } from "@earendil-works/pi-coding-agent";
 import { COMPACTION_AFFINITY_RETIRED_ENTRY, isCompactionAffinityMissing } from "./compaction-affinity";
 import { registerExtensionRuntime } from "./extension-runtime";
 import { serializeMessagesToResponsesInput } from "./serializer";
@@ -15,6 +16,8 @@ const model = {
 
 const SIGNED = { type: "compaction", id: "cmp_1", encrypted_content: "gAAAA-signed-elsewhere" };
 const RETAINED = { role: "user", content: [{ type: "input_text", text: "Remember: the codename is HERON-7." }] };
+/** The compaction item the gateway returns when this account recompacts. */
+const FRESH = { type: "compaction", id: "cmp_fresh", encrypted_content: "gAAAA-signed-here" };
 
 /** What pi-ai 0.87 records for the gateway's 409 on an openai-responses route (formatProviderError). */
 const body = (code: string, field: "code" | "type" = "code") =>
@@ -44,18 +47,24 @@ function compactionEntry(id: string, compactedWindow: unknown[], summary = NATIV
 	};
 }
 
-function toMessage(entry: Record<string, any>) {
-	return entry.type === "compaction"
-		? { role: "compactionSummary", summary: entry.summary, tokensBefore: entry.tokensBefore, timestamp: new Date(entry.timestamp).getTime() }
-		: entry.message;
+function assistantEntry(id: string, text: string) {
+	return {
+		type: "message",
+		id,
+		timestamp: "2026-10-06T07:59:00.000Z",
+		message: { role: "assistant", provider: model.provider, api: model.api, model: model.id, stopReason: "stop", content: [{ type: "text", text }], timestamp: 1 },
+	};
+}
+
+/** Pi's own context for the branch (latest compaction, kept window, tail, context edits). */
+function contextMessages(branch: Array<Record<string, any>>) {
+	const chained = branch.map((entry, index) => ({ ...entry, parentId: index > 0 ? branch[index - 1]!.id : null }));
+	return buildSessionContext(chained as never).messages;
 }
 
 /** The payload Pi itself builds: its plain summary, the kept messages, then the tail. */
 function piPayload(branch: Array<Record<string, any>>) {
-	const messages = [
-		...branch.filter((entry) => entry.type === "compaction").map(toMessage),
-		...branch.filter((entry) => entry.type === "message").map(toMessage),
-	];
+	const messages = contextMessages(branch);
 	return {
 		model: model.id,
 		instructions: "system prompt",
@@ -93,7 +102,7 @@ function turnEnd(errorMessage: string, toolResultEntryIds: string[] = []) {
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
-function harness() {
+function harness(recompact = true) {
 	const handlers = new Map<string, Handler>();
 	const notes: Array<{ text: string; level: string }> = [];
 	const v2Calls: Array<Record<string, any>> = [];
@@ -110,7 +119,7 @@ function harness() {
 			executeNativeCompaction: async () => ({ ok: false, reason: "network-error" }) as never,
 			executeV2Compaction: async (args) => {
 				v2Calls.push(args as never);
-				return { ok: false, reason: "network-error" } as never;
+				return (recompact ? { ok: true, compactionItem: FRESH, responseId: "resp_fresh" } : { ok: false, reason: "network-error" }) as never;
 			},
 			runNativeFallbackCompaction: async () => ({ ok: false, reason: "no-model-configured" }) as never,
 			executeAnthropicCompaction: async () => ({ ok: false, reason: "request-failed" }) as never,
@@ -128,7 +137,7 @@ function harness() {
 			getSessionId: () => "session-affinity",
 			getSessionFile: () => undefined,
 			getSessionDir: () => "/tmp/pbc-affinity-test",
-			buildSessionContext: () => ({ messages: (branch as Array<Record<string, any>>).filter((e) => e.type !== "custom").map(toMessage) }),
+			buildSessionContext: () => ({ messages: contextMessages(branch as Array<Record<string, any>>) }),
 		},
 	});
 	const call = (name: string, event: unknown, branch: unknown[]) => handlers.get(name)?.(event, context(branch));
@@ -140,7 +149,8 @@ const hasSignedItem = (payload: unknown) =>
 
 function commit(branch: unknown[], boundary: unknown) {
 	const entries = (boundary as { entries: Array<Record<string, unknown>> }).entries;
-	branch.push(...entries.map((entry, index) => ({ ...entry, id: `boundary-${branch.length}-${index}` })));
+	const at = branch.length;
+	branch.push(...entries.map((entry, index) => ({ timestamp: "2026-10-06T08:05:00.000Z", ...entry, id: `boundary-${at}-${index}` })));
 }
 
 describe("isCompactionAffinityMissing", () => {
@@ -160,42 +170,103 @@ describe("isCompactionAffinityMissing", () => {
 });
 
 describe("compaction affinity recovery", () => {
-	test("a 409 retires the native compaction and resends once with the retained plain text", async () => {
+	/** A V2 compaction that kept one retained user message; the assistant answer lives only in the signed item. */
+	function v2Branch(): Array<Record<string, any>> {
+		return [
+			userEntry("u0", "Remember: the codename is HERON-7."),
+			assistantEntry("a0", "Noted. The cat is called Biscuit."),
+			userEntry("kept", "kept"),
+			compactionEntry("c1", [RETAINED, SIGNED]),
+			userEntry("u2", "next question"),
+		];
+	}
+
+	test("v2: a 409 recompacts the branch transcript on the current account, then resends once with that compaction", async () => {
 		const h = harness();
-		const branch: Array<Record<string, any>> = [userEntry("kept", "kept"), compactionEntry("c1", [RETAINED, SIGNED]), userEntry("u2", "next question")];
+		const branch = v2Branch();
 		const first = await h.call("before_provider_request", { payload: piPayload(branch) }, branch);
 		expect(hasSignedItem(first)).toBe(true);
 
 		branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
-		const boundary = await h.call("turn_end", turnEnd(AFFINITY_409), branch);
-		expect(boundary).toEqual({
-			entries: [
-				{ type: "custom", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: "c1" } },
-				{ type: "context_edit", targetId: "failed", replacement: null },
-			],
-		});
+		const boundary = (await h.call("turn_end", turnEnd(AFFINITY_409), branch)) as { entries: Array<Record<string, any>> };
+		expect(boundary.entries.slice(0, 2)).toEqual([
+			{ type: "custom", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: "c1" } },
+			{ type: "context_edit", targetId: "failed", replacement: null },
+		]);
+
+		// The recompaction ran once, from the transcript the retired compaction had summarized.
+		expect(h.v2Calls).toHaveLength(1);
+		const recompactInput = JSON.stringify(h.v2Calls[0]!.request.input);
+		expect(recompactInput).toContain("The cat is called Biscuit.");
+		expect(recompactInput).toContain("HERON-7");
+		expect(recompactInput).toContain("next question");
+		expect(recompactInput).not.toContain(SIGNED.encrypted_content);
+		expect(recompactInput).not.toContain(NATIVE_COMPACTION_FALLBACK_SUMMARY);
+		const fresh = boundary.entries[2]!;
+		expect(fresh).toMatchObject({ type: "compaction", firstKeptEntryId: "failed" });
+		expect(JSON.stringify(fresh.details.compactedWindow)).toContain(FRESH.encrypted_content);
+
 		commit(branch, boundary);
 		expect(await h.call("agent_before_settle", {}, branch)).toEqual({ continue: true });
 		expect(h.notes.filter((note) => note.text.includes("compaction-affinity-recovery: "))).toHaveLength(1);
 
-		// The resend carries no compaction item; the retained plain text and the tail survive.
-		const resend = (await h.call("before_provider_request", { payload: piPayload(branch) }, branch)) as { input: unknown[] };
-		expect(resend).toBeDefined();
-		expect(hasSignedItem(resend)).toBe(false);
-		expect(JSON.stringify(resend.input)).toContain("HERON-7");
-		expect(JSON.stringify(resend.input)).toContain("next question");
-		expect(JSON.stringify(resend.input)).not.toContain(NATIVE_COMPACTION_FALLBACK_SUMMARY);
+		// The resend replays the fresh compaction (history kept), never the rejected item.
+		const resend = JSON.stringify(await h.call("before_provider_request", { payload: piPayload(branch) }, branch));
+		expect(resend).toContain(FRESH.encrypted_content);
+		expect(resend).not.toContain(SIGNED.encrypted_content);
+		expect(resend).toContain("next question");
+	});
+
+	test("v2: if the recompaction fails, recovery is blocked and no history-losing payload is ever sent", async () => {
+		const h = harness(false);
+		const branch = v2Branch();
+		await h.call("before_provider_request", { payload: piPayload(branch) }, branch);
+		branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
+		const boundary = await h.call("turn_end", turnEnd(AFFINITY_409), branch);
+		expect(boundary).toEqual({
+			entries: [{ type: "custom", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: "c1" } }],
+		});
+		expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+		const errors = h.notes.filter((note) => note.level === "error");
+		expect(errors).toHaveLength(1);
+		expect(errors[0]!.text).toContain("/compact");
+		expect(errors[0]!.text).toContain("retry");
+
+		// The next prompt carries the full branch transcript, not retained user items alone.
+		commit(branch, boundary);
+		await h.call("before_agent_start", { prompt: "retry" }, branch);
+		branch.push(userEntry("u3", "retry"));
+		const next = JSON.stringify(await h.call("before_provider_request", { payload: piPayload(branch) }, branch));
+		expect(next).toContain("The cat is called Biscuit.");
+		expect(next).toContain("HERON-7");
+		expect(next).toContain("next question");
+		expect(next).not.toContain(SIGNED.encrypted_content);
+		expect(next).not.toContain(NATIVE_COMPACTION_FALLBACK_SUMMARY);
+
+		// /compact recompacts from the same transcript, so the loss is never made permanent.
+		await h.call(
+			"session_before_compact",
+			{
+				signal: new AbortController().signal,
+				preparation: { tokensBefore: 1, firstKeptEntryId: "u3", messagesToSummarize: [], turnPrefixMessages: [] },
+			},
+			branch,
+		);
+		expect(h.v2Calls).toHaveLength(2);
+		expect(JSON.stringify(h.v2Calls[1]!.request.input)).toContain("The cat is called Biscuit.");
+		expect(hasSignedItem(h.v2Calls[1]!.request)).toBe(false);
 	});
 
 	test("a second 409 in the same turn is not recovered again", async () => {
 		const h = harness();
 		const branch: Array<Record<string, any>> = [userEntry("kept", "kept"), compactionEntry("c1", [RETAINED, SIGNED]), userEntry("u2", "next")];
 		await h.call("before_provider_request", { payload: piPayload(branch) }, branch);
+		branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
 		commit(branch, await h.call("turn_end", turnEnd(AFFINITY_409), branch));
 		expect(await h.call("agent_before_settle", {}, branch)).toEqual({ continue: true });
 
-		// The resend fails the same way: no further recovery, no further resend.
-		await h.call("before_provider_request", { payload: piPayload(branch) }, branch);
+		// The resend (now replaying the fresh compaction) fails the same way: no further recovery, no further resend.
+		expect(JSON.stringify(await h.call("before_provider_request", { payload: piPayload(branch) }, branch))).toContain(FRESH.encrypted_content);
 		expect(await h.call("turn_end", turnEnd(AFFINITY_409), branch)).toBeUndefined();
 		expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
 
@@ -204,7 +275,9 @@ describe("compaction affinity recovery", () => {
 		expect(hasSignedItem(await h.call("before_provider_request", { payload: piPayload(other) }, other))).toBe(true);
 		expect(await h.call("turn_end", turnEnd(AFFINITY_409), other)).toBeUndefined();
 		expect(await h.call("agent_before_settle", {}, other)).toBeUndefined();
-		expect(h.notes.filter((note) => note.text.includes("compaction-affinity-recovery: "))).toHaveLength(2);
+		// One recovery, then an "already-recovered" error for each later 409 in the turn.
+		expect(h.notes.filter((note) => note.text.includes("compaction-affinity-recovery: "))).toHaveLength(3);
+		expect(h.notes.filter((note) => note.text.includes("already-recovered"))).toHaveLength(2);
 
 		// The next user prompt is a new turn and may recover once again.
 		await h.call("before_agent_start", { prompt: "hi" }, other);
@@ -223,15 +296,20 @@ describe("compaction affinity recovery", () => {
 			{ type: "message", id: "t1", message: { role: "toolResult", toolCallId: call.id, toolName: "read", isError: false, content: [{ type: "text", text: "file body" }], timestamp: 3 } },
 		];
 		await h.call("before_provider_request", { payload: piPayload(branch) }, branch);
+		branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
 		const boundary = (await h.call("turn_end", turnEnd(AFFINITY_409), branch)) as { entries: Array<Record<string, unknown>> };
 		// Nothing targets the earlier tool call or its result; the error turn itself ran no tools.
 		expect(boundary.entries.filter((entry) => entry.type === "context_edit").map((entry) => entry.targetId)).toEqual(["failed"]);
 		commit(branch, boundary);
 		expect(await h.call("agent_before_settle", {}, branch)).toEqual({ continue: true });
 
-		const resend = (await h.call("before_provider_request", { payload: piPayload(branch) }, branch)) as { input: Array<Record<string, unknown>> };
-		expect(resend.input.filter((item) => item.type === "function_call")).toHaveLength(1);
-		expect(resend.input.filter((item) => item.type === "function_call_output")).toHaveLength(1);
+		// The tool call and its result go into the recompaction on this account; the resend replays it.
+		const recompactInput = h.v2Calls[0]!.request.input as Array<Record<string, unknown>>;
+		expect(recompactInput.filter((item) => item.type === "function_call")).toHaveLength(1);
+		expect(recompactInput.filter((item) => item.type === "function_call_output")).toHaveLength(1);
+		const resend = JSON.stringify(await h.call("before_provider_request", { payload: piPayload(branch) }, branch));
+		expect(resend).toContain(FRESH.encrypted_content);
+		expect(resend).not.toContain(SIGNED.encrypted_content);
 		expect(h.toolExecutions).toHaveLength(0);
 	});
 
@@ -272,8 +350,8 @@ describe("compaction affinity recovery", () => {
 		expect(JSON.stringify(piPayload(branch))).toContain("Cat is Biscuit.");
 	});
 
-	test("with no plain text to rebuild from, the block is retired and the user is told to /compact or start a new session", async () => {
-		const h = harness();
+	test("with no plain text and a failed recompaction, the block is retired and the user is told to /compact or retry", async () => {
+		const h = harness(false);
 		const branch: Array<Record<string, any>> = [userEntry("kept", "kept"), compactionEntry("c1", [SIGNED]), userEntry("u2", "next")];
 		await h.call("before_provider_request", { payload: piPayload(branch) }, branch);
 		const boundary = await h.call("turn_end", turnEnd(AFFINITY_409), branch);
@@ -285,7 +363,7 @@ describe("compaction affinity recovery", () => {
 		expect(errors).toHaveLength(1);
 		expect(errors[0]!.text).toContain("compaction-affinity-recovery: ");
 		expect(errors[0]!.text).toContain("/compact");
-		expect(errors[0]!.text).toContain("new session");
+		expect(errors[0]!.text).toContain("retry");
 
 		// Persisted: the retired block is never injected again, and /compact recompacts from Pi's own context.
 		commit(branch, boundary);
@@ -298,7 +376,8 @@ describe("compaction affinity recovery", () => {
 			},
 			branch,
 		);
-		expect(h.v2Calls).toHaveLength(1);
-		expect(hasSignedItem(h.v2Calls[0]!.request)).toBe(false);
+		// The recovery tried once to recompact; /compact recompacts again, never with the retired item.
+		expect(h.v2Calls).toHaveLength(2);
+		expect(hasSignedItem(h.v2Calls[1]!.request)).toBe(false);
 	});
 });

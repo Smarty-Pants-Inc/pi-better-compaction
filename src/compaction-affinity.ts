@@ -1,12 +1,14 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { CompactionEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { buildSessionContext, type CompactionEntry, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
 	resolveLatestNativeCompactionEntry,
 	type LatestNativeCompactionResolution,
 	type NativeCompactionEntryMatch,
 } from "./details-store";
-import type { NativeReplaySegments } from "./payload-rewrite";
+import { extractFreshAuthoritativePreamble } from "./payload-rewrite";
 import type { ResponsesCompatibleRequestPayload } from "./runtime";
+import { serializeMessagesToResponsesInput } from "./serializer";
 import { NATIVE_COMPACTION_FALLBACK_SUMMARY, type NativeCompactionEntry } from "./types";
 
 /**
@@ -53,48 +55,45 @@ export function isAffinityRetired(entries: readonly SessionEntry[], compactionEn
 	);
 }
 
-/** Items of the compacted window that carry no signed or encrypted payload. */
-function plainWindowItems(entry: NativeCompactionEntry): unknown[] {
-	return entry.details.compactedWindow.filter(
-		(item) =>
-			isRecord(item) &&
-			item.type !== "compaction" &&
-			item.type !== "compaction_summary" &&
-			item.type !== "reasoning" &&
-			!("encrypted_content" in item),
-	);
-}
-
-function hasPlainSummary(entry: NativeCompactionEntry): boolean {
+export function hasPlainSummary(entry: NativeCompactionEntry): boolean {
 	const summary = entry.summary?.trim();
 	return !!summary && summary !== NATIVE_COMPACTION_FALLBACK_SUMMARY;
 }
 
-/** Whether a retired compaction leaves any plain text to rebuild the context from. */
-export function hasAffinitySafePlaintext(entry: NativeCompactionEntry): boolean {
-	return hasPlainSummary(entry) || plainWindowItems(entry).length > 0;
+/**
+ * Pi's context for the branch as if the retired compactions never happened: the
+ * history they summarized (assistant answers, tool results, the kept window) comes
+ * back from the branch transcript as plain messages.
+ */
+export function buildAffinityRetiredSessionMessages(entries: readonly SessionEntry[]): AgentMessage[] {
+	const kept = entries.filter((entry) => !(entry.type === "compaction" && isAffinityRetired(entries, entry.id)));
+	// getBranch() is root-to-leaf, so re-linking in order keeps the path without the retired entries.
+	const chained = kept.map((entry, index) => ({ ...entry, parentId: index > 0 ? kept[index - 1]!.id : null }));
+	return buildSessionContext(chained as SessionEntry[]).messages;
 }
 
 /**
- * The request to send once a compaction is retired. A real plain-text summary means
- * Pi's own payload (summary + kept messages + tail) is already safe: undefined.
- * Otherwise the compacted window's plain items stand in for the signed item.
+ * The request to send while the latest compaction is retired. A real plain-text
+ * summary means Pi's own payload is already safe: undefined. Otherwise the history
+ * lives only in the rejected signed item, so send the full branch transcript rather
+ * than a payload that silently drops it.
  */
-export function buildAffinitySafePayload(
+export function buildAffinitySafePayload<TApi extends Api>(
+	model: Model<TApi>,
 	payload: ResponsesCompatibleRequestPayload,
-	segments: NativeReplaySegments,
+	entries: readonly SessionEntry[],
 	entry: NativeCompactionEntry,
 ): ResponsesCompatibleRequestPayload | undefined {
-	const plain = plainWindowItems(entry);
-	if (hasPlainSummary(entry) || plain.length === 0) return undefined;
+	if (hasPlainSummary(entry)) return undefined;
+	const preamble = extractFreshAuthoritativePreamble(payload);
+	if (!preamble) return undefined;
 	return {
 		...payload,
-		...(segments.instructions !== undefined ? { instructions: segments.instructions } : {}),
+		...(preamble.instructions !== undefined ? { instructions: preamble.instructions } : {}),
 		input: [
-			...segments.freshPreamble,
-			...plain.map((item) => structuredClone(item)),
-			...segments.postCompactionTail.input,
-			...segments.trailingPreamble,
+			...preamble.leadingInput,
+			...serializeMessagesToResponsesInput(model, buildAffinityRetiredSessionMessages(entries)),
+			...preamble.trailingInput,
 		],
 	};
 }

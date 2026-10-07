@@ -24,9 +24,10 @@ import { executeNativeCompaction } from "./compact-client";
 import { executeV2Compaction } from "./compact-client-v2";
 import { loadExtensionConfig } from "./config";
 import {
+	buildAffinityRetiredSessionMessages,
 	buildAffinitySafePayload,
 	COMPACTION_AFFINITY_RETIRED_ENTRY,
-	hasAffinitySafePlaintext,
+	hasPlainSummary,
 	isAffinityRetired,
 	isCompactionAffinityMissing,
 	resolveReplayableNativeCompaction,
@@ -217,9 +218,9 @@ async function runResponsesV1Compact(
 	config: ExtensionConfig,
 	runtime: NativeCompactionRuntime,
 	dependencies: ExtensionRuntimeDependencies,
+	branchEntries: readonly SessionEntry[] = ctx.sessionManager.getBranch(),
 ): Promise<ResponsesCompactOutcome> {
 	const instructions = buildCompactionInstructions(ctx.getSystemPrompt(), event.customInstructions);
-	const branchEntries = ctx.sessionManager.getBranch();
 	const latestNativeCompaction = resolveReplayableNativeCompaction(branchEntries, {
 		provider: runtime.provider,
 		api: runtime.api,
@@ -243,7 +244,7 @@ async function runResponsesV1Compact(
 		};
 	} else if (
 		latestNativeCompaction.reason === "no-compaction" ||
-		// The gateway cannot use the retired signed item; recompact from Pi's own context.
+		// The gateway cannot use the retired signed item; recompact from the branch transcript it summarized.
 		latestNativeCompaction.reason === "affinity-retired" ||
 		(latestNativeCompaction.reason === "latest-compaction-not-native" &&
 			config.allowCompactionContinuityBreak)
@@ -252,7 +253,10 @@ async function runResponsesV1Compact(
 			latestNativeCompaction.reason === "no-compaction" ? "session-context" : "non-native-session-context";
 		request = serializeMessagesToCompactRequest({
 			model: runtime.currentModel,
-			messages: buildSessionMessages(ctx),
+			messages:
+				latestNativeCompaction.reason === "affinity-retired"
+					? buildAffinityRetiredSessionMessages(branchEntries)
+					: buildSessionMessages(ctx),
 			instructions,
 		});
 	} else {
@@ -372,9 +376,9 @@ async function runResponsesV2Compact(
 	config: ExtensionConfig,
 	runtime: NativeCompactionRuntime,
 	dependencies: ExtensionRuntimeDependencies,
+	branchEntries: readonly SessionEntry[] = ctx.sessionManager.getBranch(),
 ): Promise<ResponsesCompactOutcome> {
 	const instructions = buildCompactionInstructions(ctx.getSystemPrompt(), event.customInstructions);
-	const branchEntries = ctx.sessionManager.getBranch();
 	const latestNativeCompaction = resolveReplayableNativeCompaction(branchEntries, {
 		provider: runtime.provider,
 		api: runtime.api,
@@ -398,7 +402,7 @@ async function runResponsesV2Compact(
 		};
 	} else if (
 		latestNativeCompaction.reason === "no-compaction" ||
-		// The gateway cannot use the retired signed item; recompact from Pi's own context.
+		// The gateway cannot use the retired signed item; recompact from the branch transcript it summarized.
 		latestNativeCompaction.reason === "affinity-retired" ||
 		(latestNativeCompaction.reason === "latest-compaction-not-native" &&
 			config.allowCompactionContinuityBreak)
@@ -407,7 +411,10 @@ async function runResponsesV2Compact(
 			latestNativeCompaction.reason === "no-compaction" ? "session-context" : "non-native-session-context";
 		request = serializeMessagesToCompactRequest({
 			model: runtime.currentModel,
-			messages: buildSessionMessages(ctx),
+			messages:
+				latestNativeCompaction.reason === "affinity-retired"
+					? buildAffinityRetiredSessionMessages(branchEntries)
+					: buildSessionMessages(ctx),
 			instructions,
 		});
 	} else {
@@ -909,6 +916,23 @@ async function handleBeforeProviderRequest(
 	}
 
 	const latestNativeCompactionEntry = latestNativeCompaction.entry;
+	// The gateway rejected this compaction's signed item: never inject it again.
+	if (isAffinityRetired(branchEntries, latestNativeCompactionEntry.id)) {
+		const safePayload = buildAffinitySafePayload(runtime.currentModel, payload, branchEntries, latestNativeCompactionEntry);
+		writeDebugArtifact(
+			"provider-request",
+			{
+				event: "before_provider_request.affinity-safe-replay",
+				compactionEntryId: latestNativeCompactionEntry.id,
+				rebuiltFromTranscript: Boolean(safePayload),
+				payload: safePayload ?? payload,
+			},
+			config,
+			ctx,
+		);
+		return safePayload;
+	}
+
 	const rewrite = rewriteResponsesPayloadWithNativeReplay({
 		model: runtime.currentModel,
 		payload,
@@ -935,22 +959,6 @@ async function handleBeforeProviderRequest(
 		return undefined;
 	}
 
-	// The gateway rejected this compaction's signed item: never inject it again.
-	if (isAffinityRetired(branchEntries, latestNativeCompactionEntry.id)) {
-		const safePayload = buildAffinitySafePayload(payload, rewrite.segments, latestNativeCompactionEntry);
-		writeDebugArtifact(
-			"provider-request",
-			{
-				event: "before_provider_request.affinity-safe-replay",
-				compactionEntryId: latestNativeCompactionEntry.id,
-				rebuiltFromCompactedWindow: Boolean(safePayload),
-				payload: safePayload ?? payload,
-			},
-			config,
-			ctx,
-		);
-		return safePayload;
-	}
 	state.pendingResponsesReplay = latestNativeCompactionEntry.id;
 
 	writeDebugArtifact(
@@ -995,19 +1003,50 @@ function logAffinityRecovery(
 }
 
 /**
- * The gateway answered 409 compaction_affinity_missing to a request that replayed a
- * signed compaction item: retire that compaction for good and resend the model
- * request once with plain-text context. The error turn ran no tools, so the resend
- * re-executes none. One recovery per user prompt, so this cannot loop.
+ * Recompact on the current account from the branch transcript, with the rejected
+ * compaction already retired, through the extension's own Responses compaction path.
  */
-function recoverCompactionAffinity(
+async function recompactAfterAffinityMiss(
+	ctx: ExtensionContext,
+	config: ExtensionConfig,
+	dependencies: ExtensionRuntimeDependencies,
+	branchEntries: readonly SessionEntry[],
+	firstKeptEntryId: string,
+	tokensBefore: number,
+): Promise<CompactionResult | undefined> {
+	const resolution = await resolveNativeCompactionEnvironment(ctx, {
+		enabled: config.enabled,
+		responsesCompactApis: config.responsesCompactApis,
+	});
+	if (!resolution.ok) return undefined;
+	const event = {
+		type: "session_before_compact",
+		preparation: { firstKeptEntryId, tokensBefore, messagesToSummarize: [], turnPrefixMessages: [] },
+		branchEntries,
+		signal: ctx.signal ?? new AbortController().signal,
+	} as unknown as SessionBeforeCompactEvent;
+	const run = config.compactionVersion === "v2" ? runResponsesV2Compact : runResponsesV1Compact;
+	const outcome = await run(event, ctx, config, resolution.runtime, dependencies, branchEntries);
+	return outcome.outcome === "success" ? outcome.compaction : undefined;
+}
+
+/**
+ * The gateway answered 409 compaction_affinity_missing to a request that replayed a
+ * signed compaction item: retire that compaction for good. A plain-text summary
+ * already carries the history, so Pi's own payload is resent. Otherwise the history
+ * lives only in the rejected item: recompact the branch transcript on the current
+ * account and resend once with that compaction; if that fails, resend nothing. The
+ * error turn ran no tools, so a resend re-executes none. One recovery per user
+ * prompt, so this cannot loop.
+ */
+async function recoverCompactionAffinity(
 	pi: ExtensionAPI,
 	event: TurnEndEvent,
 	ctx: ExtensionContext,
 	compactionEntryId: string,
 	dependencies: ExtensionRuntimeDependencies,
 	state: RuntimeState,
-): TurnEndEventResult | undefined {
+): Promise<TurnEndEventResult | undefined> {
 	const { config } = dependencies.loadExtensionConfig();
 	if (state.affinityRecoveryUsed) {
 		logAffinityRecovery(ctx, config, "already-recovered (one recovery per turn; not retrying again)", "error");
@@ -1016,27 +1055,58 @@ function recoverCompactionAffinity(
 	state.affinityRecoveryUsed = true;
 
 	const retire = { type: "custom" as const, customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId } };
-	const entry = ctx.sessionManager.getBranch().find((candidate) => candidate.id === compactionEntryId);
-	if (!isNativeCompactionEntry(entry) || !hasAffinitySafePlaintext(entry)) {
-		if (!event.messageEntryId) pi.appendEntry(retire.customType, retire.data);
+	const failedEntryId = event.messageEntryId;
+	if (!failedEntryId) {
+		// Pi before 0.87 has no turn_end boundary results: retire now, resend nothing.
+		pi.appendEntry(retire.customType, retire.data);
 		logAffinityRecovery(
 			ctx,
 			config,
-			"no-plaintext (the gateway rejected this session's native compaction and no plain-text context is kept; run /compact or start a new session)",
+			"retired (nothing was resent; run /compact to recompact on this account, or retry: the next prompt sends the uncompacted transcript)",
 			"error",
 		);
-		return event.messageEntryId ? { entries: [retire] } : undefined;
-	}
-	if (!event.messageEntryId) {
-		// Pi before 0.87 has no turn_end boundary results: retire now, the next prompt recovers.
-		pi.appendEntry(retire.customType, retire.data);
-		logAffinityRecovery(ctx, config, "retired (the next prompt replays plain-text context)");
 		return undefined;
 	}
+	const dropFailed = { type: "context_edit" as const, targetId: failedEntryId, replacement: null };
+	const branch = ctx.sessionManager.getBranch();
+	const entry = branch.find((candidate) => candidate.id === compactionEntryId);
+	if (isNativeCompactionEntry(entry) && hasPlainSummary(entry)) {
+		state.resendAfterAffinityRecovery = true;
+		logAffinityRecovery(ctx, config, "retrying (compaction retired; resending once with its plain-text summary)");
+		return { entries: [retire, dropFailed] };
+	}
+
+	const timestamp = new Date().toISOString();
+	const pending = [
+		...branch,
+		{ ...retire, id: `${EXTENSION_ID}.pending-retire`, parentId: null, timestamp },
+		{ ...dropFailed, id: `${EXTENSION_ID}.pending-edit`, parentId: null, timestamp },
+	] as SessionEntry[];
+	const compaction = await recompactAfterAffinityMiss(
+		ctx,
+		config,
+		dependencies,
+		pending,
+		failedEntryId,
+		isNativeCompactionEntry(entry) ? entry.tokensBefore : 0,
+	);
+	if (!compaction) {
+		logAffinityRecovery(
+			ctx,
+			config,
+			"blocked (recompaction on this account failed; nothing was resent, because a resend without the compaction would drop the summarized history; run /compact or retry)",
+			"error",
+		);
+		return { entries: [retire] };
+	}
 	state.resendAfterAffinityRecovery = true;
-	logAffinityRecovery(ctx, config, "retrying (compaction retired; resending once with plain-text context)");
+	logAffinityRecovery(ctx, config, "retrying (compaction retired and recompacted on this account; resending once)");
 	return {
-		entries: [retire, { type: "context_edit", targetId: event.messageEntryId, replacement: null }],
+		entries: [
+			retire,
+			dropFailed,
+			{ type: "compaction", summary: compaction.summary, firstKeptEntryId: failedEntryId, details: compaction.details },
+		],
 	};
 }
 
