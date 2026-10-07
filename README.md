@@ -2,7 +2,7 @@
 
 English | [中文](README.zh-CN.md)
 
-A [pi](https://github.com/nicepkg/pi) extension that upgrades context compaction with two coordinated strategies:
+A [pi](https://github.com/nicepkg/pi) extension that upgrades context compaction with three coordinated strategies:
 
 1. **OpenAI Responses APIs**, including supported GitHub Copilot models, use the provider's native compaction endpoint, preserving opaque context that plain text summaries lose.
 2. **Anthropic Messages API** uses Anthropic's on-demand server-side compaction (beta `compact-2026-09-04`) and replays the signed compaction block.

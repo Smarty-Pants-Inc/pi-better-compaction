@@ -331,7 +331,14 @@ describe("executeAnthropicCompaction with a gateway that injects context_managem
 	}
 
 	const base = { model: opus as never, systemPrompt: "sys", messages: [] };
-	const source = { model: "claude-opus-5-5", messages: [{ role: "user", content: "hi" }], thinking: THINKING };
+	const source = {
+		model: "claude-opus-5-5",
+		messages: [
+			{ role: "assistant", content: [{ type: "thinking", thinking: "prior reasoning", signature: "sig-prior" }] },
+			{ role: "user", content: "hi" },
+		],
+		thinking: THINKING,
+	};
 
 	test("retries once without thinking and returns the block", async () => {
 		const { result, sent } = await withGateway(() =>
@@ -352,6 +359,38 @@ describe("executeAnthropicCompaction with a gateway that injects context_managem
 		);
 		expect(sent).toHaveLength(1);
 		expect(result).toMatchObject({ ok: false, reason: "request-failed", status: 400 });
+	});
+
+	test("does not retry when thinking is explicitly disabled", async () => {
+		const { result, sent } = await withGateway(
+			() => executeAnthropicCompaction({ ...base, complete: fakeComplete({ ...source, thinking: { type: "disabled" } }) }),
+			() => new Response(CONFLICT, { status: 400 }),
+		);
+		expect(sent).toHaveLength(1);
+		expect(result).toMatchObject({ ok: false, reason: "request-failed", status: 400 });
+	});
+
+	test("stops after one retry if the same conflict persists", async () => {
+		const { result, sent } = await withGateway(
+			() => executeAnthropicCompaction({ ...base, complete: fakeComplete(source) }),
+			() => new Response(CONFLICT, { status: 400 }),
+		);
+		expect(sent).toHaveLength(2);
+		expect(sent[1]!.thinking).toBeUndefined();
+		expect(result).toMatchObject({ ok: false, reason: "request-failed", status: 400 });
+	});
+
+	test("does not retry an aborted request", async () => {
+		const controller = new AbortController();
+		const { result, sent } = await withGateway(
+			() => executeAnthropicCompaction({ ...base, signal: controller.signal, complete: fakeComplete(source) }),
+			() => {
+				controller.abort();
+				return new Response(CONFLICT, { status: 400 });
+			},
+		);
+		expect(sent).toHaveLength(1);
+		expect(result).toEqual({ ok: false, reason: "aborted" });
 	});
 
 	test("does not retry other 400s", async () => {

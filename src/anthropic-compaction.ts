@@ -360,7 +360,7 @@ async function requestAnthropicCompaction(
 				onPayload: (payload: unknown) => {
 					const next = buildCompactionPayload(payload, { ...options, omitThinking });
 					if (!next) throw new Error("unexpected Anthropic payload shape");
-					sentThinking = next.thinking !== undefined;
+					sentThinking = isRecord(next.thinking) && (next.thinking.type === "enabled" || next.thinking.type === "adaptive");
 					return next;
 				},
 			},
