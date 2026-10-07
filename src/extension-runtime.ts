@@ -28,6 +28,7 @@ import {
 	buildAffinitySafePayload,
 	COMPACTION_AFFINITY_RETIRED_ENTRY,
 	hasPlainSummary,
+	isAffinityRebuildComplete,
 	isAffinityRetired,
 	isCompactionAffinityMissing,
 	resolveReplayableNativeCompaction,
@@ -918,18 +919,25 @@ async function handleBeforeProviderRequest(
 	const latestNativeCompactionEntry = latestNativeCompaction.entry;
 	// The gateway rejected this compaction's signed item: never inject it again.
 	if (isAffinityRetired(branchEntries, latestNativeCompactionEntry.id)) {
-		const safePayload = buildAffinitySafePayload(runtime.currentModel, payload, branchEntries, latestNativeCompactionEntry);
+		const safe = buildAffinitySafePayload(runtime.currentModel, payload, branchEntries, latestNativeCompactionEntry);
+		// Fail closed: Pi's payload carries only placeholder summaries, so abort before
+		// the SDK sends anything; the empty input holds no truncated history either.
+		const safePayload = safe.ok ? safe.payload : { ...payload, input: [] };
 		writeDebugArtifact(
 			"provider-request",
 			{
-				event: "before_provider_request.affinity-safe-replay",
+				event: safe.ok ? "before_provider_request.affinity-safe-replay" : "before_provider_request.affinity-blocked",
 				compactionEntryId: latestNativeCompactionEntry.id,
-				rebuiltFromTranscript: Boolean(safePayload),
+				rebuiltFromTranscript: Boolean(safe.ok && safe.payload),
 				payload: safePayload ?? payload,
 			},
 			config,
 			ctx,
 		);
+		if (!safe.ok) {
+			ctx.abort();
+			logAffinityRecovery(ctx, config, AFFINITY_BLOCKED, "error");
+		}
 		return safePayload;
 	}
 
@@ -989,6 +997,9 @@ async function handleBeforeProviderRequest(
 
 	return rewrite.rewrittenPayload;
 }
+
+const AFFINITY_BLOCKED =
+	"blocked (the context rebuilt without the retired compaction would drop compacted history; nothing was sent; run /compact or retry)";
 
 function logAffinityRecovery(
 	ctx: ExtensionContext,
@@ -1070,18 +1081,24 @@ async function recoverCompactionAffinity(
 	const dropFailed = { type: "context_edit" as const, targetId: failedEntryId, replacement: null };
 	const branch = ctx.sessionManager.getBranch();
 	const entry = branch.find((candidate) => candidate.id === compactionEntryId);
-	if (isNativeCompactionEntry(entry) && hasPlainSummary(entry)) {
-		state.resendAfterAffinityRecovery = true;
-		logAffinityRecovery(ctx, config, "retrying (compaction retired; resending once with its plain-text summary)");
-		return { entries: [retire, dropFailed] };
-	}
-
 	const timestamp = new Date().toISOString();
 	const pending = [
 		...branch,
 		{ ...retire, id: `${EXTENSION_ID}.pending-retire`, parentId: null, timestamp },
 		{ ...dropFailed, id: `${EXTENSION_ID}.pending-edit`, parentId: null, timestamp },
 	] as SessionEntry[];
+	if (!isAffinityRebuildComplete(pending)) {
+		// An earlier compaction still in force has only a placeholder summary, so neither a
+		// resend nor a recompaction would carry its history: retire, resend nothing.
+		logAffinityRecovery(ctx, config, AFFINITY_BLOCKED, "error");
+		return { entries: [retire] };
+	}
+	if (isNativeCompactionEntry(entry) && hasPlainSummary(entry)) {
+		state.resendAfterAffinityRecovery = true;
+		logAffinityRecovery(ctx, config, "retrying (compaction retired; resending once with its plain-text summary)");
+		return { entries: [retire, dropFailed] };
+	}
+
 	const compaction = await recompactAfterAffinityMiss(
 		ctx,
 		config,

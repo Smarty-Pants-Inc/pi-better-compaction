@@ -107,6 +107,8 @@ function harness(recompact = true) {
 	const notes: Array<{ text: string; level: string }> = [];
 	const v2Calls: Array<Record<string, any>> = [];
 	const toolExecutions: unknown[] = [];
+	/** ctx.abort() calls: a fail-closed request is aborted before the SDK sends it. */
+	const aborts: unknown[] = [];
 	registerExtensionRuntime(
 		{
 			on: (name: string, handler: Handler) => handlers.set(name, handler),
@@ -128,6 +130,7 @@ function harness(recompact = true) {
 	const context = (branch: unknown[]) => ({
 		cwd: "/tmp/pbc-affinity-test",
 		hasUI: true,
+		abort: () => aborts.push(true),
 		ui: { notify: (text: string, level: string) => notes.push({ text, level }) },
 		model,
 		getSystemPrompt: () => "system prompt",
@@ -141,7 +144,7 @@ function harness(recompact = true) {
 		},
 	});
 	const call = (name: string, event: unknown, branch: unknown[]) => handlers.get(name)?.(event, context(branch));
-	return { call, notes, v2Calls, toolExecutions };
+	return { call, notes, v2Calls, toolExecutions, aborts };
 }
 
 const hasSignedItem = (payload: unknown) =>
@@ -311,6 +314,74 @@ describe("compaction affinity recovery", () => {
 		expect(resend).toContain(FRESH.encrypted_content);
 		expect(resend).not.toContain(SIGNED.encrypted_content);
 		expect(h.toolExecutions).toHaveLength(0);
+	});
+
+	test("consecutive v2: a 409 on the second compaction after an earlier placeholder one fails closed: no recompaction, no resend, error shown", async () => {
+		const h = harness();
+		const branch: Array<Record<string, any>> = [
+			userEntry("u0", "Remember: the codename is HERON-7."),
+			assistantEntry("a0", "Noted. The cat is called Biscuit."),
+			userEntry("kept", "kept"),
+			// The earlier native compaction: its history lives only in its own signed item.
+			compactionEntry("c0", [RETAINED, { ...SIGNED, id: "cmp_0", encrypted_content: "gAAAA-older-signed" }]),
+			userEntry("u1", "middle question"),
+			assistantEntry("a1", "Middle answer: the dog is called Juniper."),
+			{ ...compactionEntry("c1", [RETAINED, SIGNED]), firstKeptEntryId: "u1" },
+			userEntry("u2", "next question"),
+		];
+		expect(hasSignedItem(await h.call("before_provider_request", { payload: piPayload(branch) }, branch))).toBe(true);
+		branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
+		const boundary = await h.call("turn_end", turnEnd(AFFINITY_409), branch);
+
+		// Retiring c1 leaves c0's placeholder in force, so the rebuilt context is incomplete:
+		// c1 is retired, nothing is recompacted and nothing is resent.
+		expect(boundary).toEqual({
+			entries: [{ type: "custom", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: "c1" } }],
+		});
+		expect(h.v2Calls).toHaveLength(0);
+		expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+		const errors = h.notes.filter((note) => note.level === "error");
+		expect(errors).toHaveLength(1);
+		expect(errors[0]!.text).toContain("compaction-affinity-recovery: blocked");
+		expect(errors[0]!.text).toContain("/compact");
+		expect(errors[0]!.text).toContain("retry");
+
+		// The next prompt fails closed too: the request is aborted, never Pi's placeholder payload.
+		commit(branch, boundary);
+		await h.call("before_agent_start", { prompt: "retry" }, branch);
+		branch.push(userEntry("u3", "retry"));
+		const original = piPayload(branch);
+		const next = (await h.call("before_provider_request", { payload: original }, branch)) as { input: unknown[] } | undefined;
+		expect(h.aborts).toHaveLength(1);
+		expect(next).toBeDefined();
+		expect(next).not.toEqual(original);
+		expect(next!.input).toEqual([]);
+		expect(JSON.stringify(next)).not.toContain(NATIVE_COMPACTION_FALLBACK_SUMMARY);
+		expect(h.notes.filter((note) => note.level === "error")).toHaveLength(2);
+	});
+
+	test("a retired v2 compaction without plain text and without a recognizable preamble fails closed, never Pi's payload", async () => {
+		const h = harness();
+		const branch: Array<Record<string, any>> = [
+			userEntry("kept", "kept"),
+			compactionEntry("c1", [RETAINED, SIGNED]),
+			{ type: "custom", id: "r1", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: "c1" } },
+			userEntry("u2", "next"),
+		];
+		// A developer item inside the transcript: extractFreshAuthoritativePreamble returns nothing.
+		const pi = piPayload(branch);
+		const original = { ...pi, input: [pi.input[0], pi.input[1], { role: "developer", content: "mid-transcript note" }, ...pi.input.slice(2)] };
+		expect(JSON.stringify(original)).toContain(NATIVE_COMPACTION_FALLBACK_SUMMARY);
+		const result = (await h.call("before_provider_request", { payload: original }, branch)) as { input: unknown[] } | undefined;
+		expect(result).toBeDefined();
+		expect(result).not.toEqual(original);
+		expect(result!.input).toEqual([]);
+		expect(JSON.stringify(result)).not.toContain(NATIVE_COMPACTION_FALLBACK_SUMMARY);
+		expect(h.aborts).toHaveLength(1);
+		const errors = h.notes.filter((note) => note.level === "error");
+		expect(errors).toHaveLength(1);
+		expect(errors[0]!.text).toContain("/compact");
+		expect(errors[0]!.text).toContain("retry");
 	});
 
 	test("other 409s, other statuses and requests without a compaction item are untouched", async () => {

@@ -9,7 +9,7 @@ import {
 import { extractFreshAuthoritativePreamble } from "./payload-rewrite";
 import type { ResponsesCompatibleRequestPayload } from "./runtime";
 import { serializeMessagesToResponsesInput } from "./serializer";
-import { NATIVE_COMPACTION_FALLBACK_SUMMARY, type NativeCompactionEntry } from "./types";
+import { NATIVE_COMPACTION_FALLBACK_SUMMARY, isNativeCompactionEntry, type NativeCompactionEntry } from "./types";
 
 /**
  * Custom session entry recorded when the gateway answers 409 `compaction_affinity_missing`:
@@ -61,6 +61,17 @@ export function hasPlainSummary(entry: NativeCompactionEntry): boolean {
 }
 
 /**
+ * Whether a context rebuilt from the branch transcript keeps all history: no
+ * compaction still in force holds its history only in a signed item. Pi would
+ * rebuild such a compaction from its placeholder summary and drop that history.
+ */
+export function isAffinityRebuildComplete(entries: readonly SessionEntry[]): boolean {
+	return !entries.some(
+		(entry) => isNativeCompactionEntry(entry) && !hasPlainSummary(entry) && !isAffinityRetired(entries, entry.id),
+	);
+}
+
+/**
  * Pi's context for the branch as if the retired compactions never happened: the
  * history they summarized (assistant answers, tool results, the kept window) comes
  * back from the branch transcript as plain messages.
@@ -74,20 +85,23 @@ export function buildAffinityRetiredSessionMessages(entries: readonly SessionEnt
 
 /**
  * The request to send while the latest compaction is retired. A real plain-text
- * summary means Pi's own payload is already safe: undefined. Otherwise the history
- * lives only in the rejected signed item, so send the full branch transcript rather
- * than a payload that silently drops it.
+ * summary means Pi's own payload is already safe: `{ ok: true }`. Otherwise the
+ * history lives only in the rejected signed item, so send the full branch
+ * transcript rather than a payload that silently drops it. `{ ok: false }` when
+ * neither is safe (an earlier compaction still in force has only a placeholder, or
+ * the request has no recognizable prompt preamble): the caller must send nothing.
  */
 export function buildAffinitySafePayload<TApi extends Api>(
 	model: Model<TApi>,
 	payload: ResponsesCompatibleRequestPayload,
 	entries: readonly SessionEntry[],
 	entry: NativeCompactionEntry,
-): ResponsesCompatibleRequestPayload | undefined {
-	if (hasPlainSummary(entry)) return undefined;
+): { ok: true; payload?: ResponsesCompatibleRequestPayload } | { ok: false } {
+	if (!isAffinityRebuildComplete(entries)) return { ok: false };
+	if (hasPlainSummary(entry)) return { ok: true };
 	const preamble = extractFreshAuthoritativePreamble(payload);
-	if (!preamble) return undefined;
-	return {
+	if (!preamble) return { ok: false };
+	return { ok: true, payload: {
 		...payload,
 		...(preamble.instructions !== undefined ? { instructions: preamble.instructions } : {}),
 		input: [
@@ -95,7 +109,7 @@ export function buildAffinitySafePayload<TApi extends Api>(
 			...serializeMessagesToResponsesInput(model, buildAffinityRetiredSessionMessages(entries)),
 			...preamble.trailingInput,
 		],
-	};
+	} };
 }
 
 /** The latest native compaction for a compaction request, unless the gateway retired it. */
