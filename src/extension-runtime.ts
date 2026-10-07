@@ -79,28 +79,33 @@ type RuntimeState = {
  * Warning for a model that cannot read the latest compaction.
  *
  * An OpenAI native checkpoint is an opaque window that only replays for the
- * provider and model that produced it; Pi's own summary for it is only a
+ * provider, API and model that produced it; Pi's own summary for it is only a
  * placeholder. Any other model would continue with the placeholder plus the
  * kept messages. Returns undefined when the latest compaction is readable.
  */
 export function describeUnreadableCheckpoint(
 	branchEntries: readonly SessionEntry[],
-	model: { provider: string; id: string } | undefined,
+	model: { provider: string; api: string; id: string } | undefined,
 ): { key: string; message: string } | undefined {
 	const latest = findLatestCompactionEntry(branchEntries);
-	if (!model || !isNativeCompactionEntry(latest) || latest.summary !== NATIVE_COMPACTION_FALLBACK_SUMMARY) {
+	if (
+		!model || !isNativeCompactionEntry(latest) ||
+		latest.details.strategy === ANTHROPIC_COMPACTION_STRATEGY ||
+		latest.summary !== NATIVE_COMPACTION_FALLBACK_SUMMARY
+	) {
 		return undefined;
 	}
-	const { provider, model: checkpointModel } = latest.details;
-	if (provider === model.provider && checkpointModel === model.id) {
+	const { provider, api, model: checkpointModel } = latest.details;
+	// Do not compare configured base URLs: OAuth may resolve a different endpoint.
+	if (provider === model.provider && api === model.api && checkpointModel === model.id) {
 		return undefined;
 	}
 	return {
 		key: `${latest.id}|${model.provider}/${model.id}`,
 		message:
-			`the latest compaction is an OpenAI native checkpoint that only ${provider}/${checkpointModel} can read. ` +
-			`${model.provider}/${model.id} will see only the messages kept after it. ` +
-			"To continue with the full history, use /tree to branch from the entry before that compaction.",
+			`the latest compaction is an OpenAI native checkpoint replayed only for ${provider}/${checkpointModel} (${api}). ` +
+			`${model.provider}/${model.id} will see only the retained messages, not the checkpoint's earlier history. ` +
+			"To recover earlier context, use /tree to branch from before the first incompatible compaction.",
 	};
 }
 
