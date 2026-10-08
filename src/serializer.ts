@@ -410,7 +410,8 @@ function serializeAssistantMessage(message: AssistantMessage, messageIndex: numb
 		const [callId, rawItemId] = block.id.split("|");
 		items.push({
 			type: "function_call",
-			id: rawItemId,
+			// Item IDs belong to a Responses type; ctc_* cannot identify a function_call.
+			id: rawItemId?.startsWith("fc_") ? rawItemId : undefined,
 			call_id: callId,
 			name: block.name,
 			arguments: JSON.stringify(block.arguments),
