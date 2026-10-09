@@ -4,6 +4,7 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	SessionBeforeCompactEvent,
+	SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
@@ -12,6 +13,7 @@ import {
 	executeAnthropicCompaction,
 	getAnthropicTools,
 	isAnthropicMessagesPayload,
+	isContextManagementConflict,
 	rememberAnthropicTools,
 	replaceSummaryWithBlock,
 	resolveAnthropicReplay,
@@ -41,6 +43,8 @@ import {
 	createNativeCompactionResult,
 	EXTENSION_ID,
 	isNativeCompactionDetails,
+	isNativeCompactionEntry,
+	NATIVE_COMPACTION_FALLBACK_SUMMARY,
 	NATIVE_COMPACTION_STRATEGY,
 	NATIVE_COMPACTION_STRATEGY_V2,
 	type ExtensionConfig,
@@ -69,21 +73,58 @@ type RuntimeState = {
 	pendingAnthropicReplay?: string;
 	/** Set when a rejected block retired this run; the next settle resends once. */
 	resendAfterBlockRejection?: boolean;
+	/** `${compactionEntryId}|${provider}/${model}` pairs already warned about on model_select. */
+	warnedCheckpointSwitches?: Set<string>;
 };
 
 /**
  * The error text Pi records when Anthropic rejects a replayed block, for example
  * 400 {"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content.0: invalid `signature` in `compaction` block"}}.
- * Only a 400 that names the compaction block matches.
+ * Only a 400 that names the compaction block matches, or the 400 Anthropic
+ * returns when a gateway (CLIProxyAPI with thinking on) adds `context_management`
+ * to an ordinary request that replays the block.
  */
 const ANTHROPIC_BLOCK_REJECTION = /^400\b[\s\S]*\bcompaction`?\s+block\b/;
 
 function isAnthropicBlockRejection(message: AgentMessage): boolean {
-	return (
-		message.role === "assistant" &&
-		message.stopReason === "error" &&
-		ANTHROPIC_BLOCK_REJECTION.test(message.errorMessage ?? "")
-	);
+	if (message.role !== "assistant" || message.stopReason !== "error") return false;
+	const errorMessage = message.errorMessage ?? "";
+	const status = Number(/^(\d{3})\b/.exec(errorMessage)?.[1]);
+	return ANTHROPIC_BLOCK_REJECTION.test(errorMessage) || isContextManagementConflict(status, errorMessage);
+}
+
+/**
+ * Warning for a model that cannot read the latest compaction.
+ *
+ * An OpenAI native checkpoint is an opaque window that only replays for the
+ * provider, API and model that produced it; Pi's own summary for it is only a
+ * placeholder. Any other model would continue with the placeholder plus the
+ * kept messages. Returns undefined when the latest compaction is readable.
+ */
+export function describeUnreadableCheckpoint(
+	branchEntries: readonly SessionEntry[],
+	model: { provider: string; api: string; id: string } | undefined,
+): { key: string; message: string } | undefined {
+	const latest = findLatestCompactionEntry(branchEntries);
+	if (
+		!model || !isNativeCompactionEntry(latest) ||
+		latest.details.strategy === ANTHROPIC_COMPACTION_STRATEGY ||
+		latest.summary !== NATIVE_COMPACTION_FALLBACK_SUMMARY
+	) {
+		return undefined;
+	}
+	const { provider, api, model: checkpointModel } = latest.details;
+	// Do not compare configured base URLs: OAuth may resolve a different endpoint.
+	if (provider === model.provider && api === model.api && checkpointModel === model.id) {
+		return undefined;
+	}
+	return {
+		key: `${latest.id}|${model.provider}/${model.id}`,
+		message:
+			`the latest compaction is an OpenAI native checkpoint replayed only for ${provider}/${checkpointModel} (${api}). ` +
+			`${model.provider}/${model.id} will see only the retained messages, not the checkpoint's earlier history. ` +
+			"To recover earlier context, use /tree to branch from before the first incompatible compaction.",
+	};
 }
 
 const DEFAULT_DEPENDENCIES: ExtensionRuntimeDependencies = {
@@ -570,6 +611,7 @@ async function runAnthropicCompact(
 			...identity,
 			compactResponseId: result.messageId,
 			priorBlockReplayed: Boolean(priorReplay),
+			retriedWithoutThinking: Boolean(result.retriedWithoutThinking),
 			summarizedMessages: messages.length,
 			firstKeptEntryId: event.preparation.firstKeptEntryId,
 		},
@@ -982,6 +1024,16 @@ export function registerExtensionRuntime(
 		if (!state.resendAfterBlockRejection) return undefined;
 		state.resendAfterBlockRejection = false;
 		return { continue: true };
+	});
+
+	pi.on("model_select", (event, ctx) => {
+		if (!ctx.hasUI || !dependencies.loadExtensionConfig().config.enabled) return;
+		const warning = describeUnreadableCheckpoint(ctx.sessionManager.getBranch(), event.model);
+		if (!warning) return;
+		state.warnedCheckpointSwitches ??= new Set();
+		if (state.warnedCheckpointSwitches.has(warning.key)) return;
+		state.warnedCheckpointSwitches.add(warning.key);
+		notifyWarning(ctx, warning.message);
 	});
 
 	pi.on("session_compact_failed", (event, ctx) => {
