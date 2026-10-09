@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildSessionContext } from "@earendil-works/pi-coding-agent";
-import { COMPACTION_AFFINITY_RETIRED_ENTRY, isCompactionAffinityMissing } from "./compaction-affinity";
+import { buildAffinityRetiredSessionMessages, buildAffinitySafePayload, COMPACTION_AFFINITY_RETIRED_ENTRY, isAffinityRebuildComplete, isCompactionAffinityMissing } from "./compaction-affinity";
 import { registerExtensionRuntime } from "./extension-runtime";
 import { serializeMessagesToResponsesInput } from "./serializer";
 import { DEFAULT_EXTENSION_CONFIG, NATIVE_COMPACTION_FALLBACK_SUMMARY, NATIVE_COMPACTION_STRATEGY, NATIVE_COMPACTION_STRATEGY_V2, createNativeCompactionDetails } from "./types";
@@ -54,6 +54,14 @@ function assistantEntry(id: string, text: string) {
 		timestamp: "2026-10-06T07:59:00.000Z",
 		message: { role: "assistant", provider: model.provider, api: model.api, model: model.id, stopReason: "stop", content: [{ type: "text", text }], timestamp: 1 },
 	};
+}
+
+/** Materialize Pi's append-only parent links once; never repair an explicit gap. */
+function linkBranch(branch: Array<Record<string, any>>) {
+	for (const [index, entry] of branch.entries()) {
+		if (!("parentId" in entry)) entry.parentId = index > 0 ? branch[index - 1]!.id : null;
+	}
+	return branch;
 }
 
 /** Pi's own context for the branch (latest compaction, kept window, tail, context edits). */
@@ -147,7 +155,10 @@ function harness(recompact = true, compactionVersion: "v1" | "v2" = "v2", curren
 			buildSessionContext: () => ({ messages: contextMessages(branch as Array<Record<string, any>>) }),
 		},
 	});
-	const call = (name: string, event: unknown, branch: unknown[]) => handlers.get(name)?.(event, context(branch));
+	const call = (name: string, event: unknown, branch: unknown[]) => {
+		linkBranch(branch as Array<Record<string, any>>);
+		return handlers.get(name)?.(event, context(branch));
+	};
 	return { call, notes, v1Calls, v2Calls, toolExecutions, aborts };
 }
 
@@ -158,6 +169,7 @@ function commit(branch: unknown[], boundary: unknown) {
 	const entries = (boundary as { entries: Array<Record<string, unknown>> }).entries;
 	const at = branch.length;
 	branch.push(...entries.map((entry, index) => ({ timestamp: "2026-10-06T08:05:00.000Z", ...entry, id: `boundary-${at}-${index}` })));
+	linkBranch(branch as Array<Record<string, any>>);
 }
 
 describe("isCompactionAffinityMissing", () => {
@@ -266,7 +278,7 @@ describe("compaction affinity recovery", () => {
 
 	test("a second 409 in the same turn is not recovered again", async () => {
 		const h = harness();
-		const branch: Array<Record<string, any>> = [userEntry("kept", "kept"), compactionEntry("c1", [RETAINED, SIGNED]), userEntry("u2", "next")];
+		const branch: Array<Record<string, any>> = [userEntry("u0", "Original question"), assistantEntry("a0", "Original answer"), userEntry("kept", "kept"), compactionEntry("c1", [RETAINED, SIGNED]), userEntry("u2", "next")];
 		await h.call("before_provider_request", { payload: piPayload(branch) }, branch);
 		branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
 		commit(branch, await h.call("turn_end", turnEnd(AFFINITY_409), branch));
@@ -278,7 +290,7 @@ describe("compaction affinity recovery", () => {
 		expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
 
 		// Even a different signed compaction replayed in the same turn is not recovered a second time.
-		const other: Array<Record<string, any>> = [userEntry("kept", "kept"), compactionEntry("c2", [RETAINED, SIGNED]), userEntry("u3", "again")];
+		const other: Array<Record<string, any>> = [userEntry("u0", "Original question"), assistantEntry("a0", "Original answer"), userEntry("kept", "kept"), compactionEntry("c2", [RETAINED, SIGNED]), userEntry("u3", "again")];
 		expect(hasSignedItem(await h.call("before_provider_request", { payload: piPayload(other) }, other))).toBe(true);
 		expect(await h.call("turn_end", turnEnd(AFFINITY_409), other)).toBeUndefined();
 		expect(await h.call("agent_before_settle", {}, other)).toBeUndefined();
@@ -296,6 +308,7 @@ describe("compaction affinity recovery", () => {
 		const h = harness();
 		const call = { type: "toolCall", id: "call_1|fc_1", name: "read", arguments: { path: "a.ts" } };
 		const branch: Array<Record<string, any>> = [
+			userEntry("u0", "Original question"), assistantEntry("a0", "Original answer"),
 			userEntry("kept", "kept"),
 			compactionEntry("c1", [RETAINED, SIGNED]),
 			userEntry("u2", "read a.ts"),
@@ -318,6 +331,124 @@ describe("compaction affinity recovery", () => {
 		expect(resend).toContain(FRESH.encrypted_content);
 		expect(resend).not.toContain(SIGNED.encrypted_content);
 		expect(h.toolExecutions).toHaveLength(0);
+	});
+
+	/** Assert all three fail-closed paths, not just the coverage predicate. */
+	async function expectGapBlocked(branch: Array<Record<string, any>>, version: "v1" | "v2") {
+		const h = harness(true, version);
+		const latestId = branch.filter((entry) => entry.type === "compaction").at(-1)!.id;
+		expect(hasSignedItem(await h.call("before_provider_request", { payload: piPayload(branch) }, branch))).toBe(true);
+		branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
+		const beforeRecovery = JSON.stringify(linkBranch(branch));
+		const boundary = await h.call("turn_end", turnEnd(AFFINITY_409), branch);
+		expect(JSON.stringify(branch)).toBe(beforeRecovery);
+		expect(boundary).toEqual({ entries: [{ type: "custom", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: latestId } }] });
+		expect(h.v1Calls).toHaveLength(0);
+		expect(h.v2Calls).toHaveLength(0);
+		expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+		commit(branch, boundary);
+		await h.call("before_agent_start", { prompt: "retry" }, branch);
+		branch.push(userEntry("retry", "retry"));
+		const blocked = await h.call("before_provider_request", { payload: piPayload(branch) }, branch) as { input: unknown[] };
+		expect(blocked.input).toEqual([]);
+		expect(h.aborts).toHaveLength(1);
+		const beforeCompact = JSON.stringify(branch);
+		expect(await h.call("session_before_compact", {
+			signal: new AbortController().signal,
+			preparation: { tokensBefore: 1, firstKeptEntryId: "retry", messagesToSummarize: [], turnPrefixMessages: [] },
+		}, branch)).toEqual({ cancel: true });
+		expect(JSON.stringify(branch)).toBe(beforeCompact);
+		expect(h.v1Calls).toHaveLength(0);
+		expect(h.v2Calls).toHaveLength(0);
+		expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+		const errors = h.notes.filter((note) => note.level === "error");
+		expect(errors).toHaveLength(3);
+		for (const error of errors) {
+			expect(error.text).toContain("compaction-affinity-recovery:");
+			expect(error.text).toContain("/new");
+			expect(error.text).toContain("/tree");
+			expect(error.text).not.toContain("/compact");
+		}
+	}
+
+	for (const version of ["v1", "v2"] as const) {
+		test(`SEC P1 ${version}: truncated pre-boundary transcript with a surviving earlier summary blocks visibly without sending`, async () => {
+			const full = linkBranch([
+				userEntry("original", "Original question"), assistantEntry("original-answer", "Original answer"),
+				userEntry("earlier-kept", "Earlier kept question"),
+				{ ...compactionEntry("plain", [SIGNED], "A surviving nonempty earlier summary."), firstKeptEntryId: "earlier-kept", details: undefined },
+				userEntry("missing", "A lost turn"), assistantEntry("partial", "One surviving answer is not the whole window"),
+				userEntry("kept", "Retained boundary survives"), compactionEntry("opaque", [RETAINED, SIGNED]), userEntry("tail", "Next question"),
+			]);
+			await expectGapBlocked(full.filter((entry) => !["original", "original-answer", "missing"].includes(entry.id)), version);
+		});
+
+		test(`SEC P1 ${version}: summaries and the retained boundary alone are never transcript evidence`, async () => {
+			for (const prefix of [
+				[{ ...compactionEntry("plain", [SIGNED], "A surviving nonempty earlier summary."), firstKeptEntryId: "missing-original", details: undefined }],
+				[{ ...compactionEntry("plain", [SIGNED], "A surviving nonempty earlier summary."), firstKeptEntryId: "plain", details: undefined }],
+				[{ type: "branch_summary", id: "summary", fromId: "abandoned", summary: "A surviving branch summary." }],
+				[],
+			]) {
+				await expectGapBlocked(linkBranch([
+					...prefix, userEntry("kept", "Retained boundary survives"), compactionEntry("opaque", [RETAINED, SIGNED]), userEntry("tail", "Next question"),
+				]), version);
+			}
+		});
+
+		test(`SEC P1 ${version}: a missing middle entry in window 2 of 3 blocks the entire recovery`, async () => {
+			const full = linkBranch([
+				userEntry("original", "Oldest question"), assistantEntry("oldest-answer", "Oldest answer"),
+				userEntry("boundary-1", "Middle question"), { ...compactionEntry("c0", [SIGNED]), firstKeptEntryId: "boundary-1" },
+				assistantEntry("middle-answer", "Middle answer"), userEntry("missing-middle", "Missing middle turn"), assistantEntry("surviving-middle", "Surviving middle answer"),
+				userEntry("boundary-2", "Latest question"), { ...compactionEntry("c1", [SIGNED]), firstKeptEntryId: "boundary-2" },
+				assistantEntry("latest-answer", "Latest answer"), userEntry("kept", "Kept question"), compactionEntry("c2", [SIGNED]), userEntry("tail", "Next question"),
+			]);
+			await expectGapBlocked(full.filter((entry) => entry.id !== "missing-middle"), version);
+		});
+
+		for (const missing of ["result", "call"] as const) {
+			test(`SEC P1 ${version}: orphan tool ${missing === "result" ? "call (result missing)" : "result (call missing)"} in the window blocks even with an intact parent chain`, async () => {
+				const call = { type: "toolCall", id: "call_orphan|fc_orphan", name: "read", arguments: { path: "lost.ts" } };
+				// Construct an intact chain: pairing must fail independently of parent coverage.
+				await expectGapBlocked(linkBranch([
+					userEntry("original", "Read lost.ts"),
+					...(missing === "result" ? [{ type: "message", id: "orphan-call", message: { role: "assistant", provider: model.provider, api: model.api, model: model.id, stopReason: "toolUse", content: [call], timestamp: 2 } }]
+						: [{ type: "message", id: "orphan-result", message: { role: "toolResult", toolCallId: call.id, toolName: call.name, isError: false, content: [{ type: "text", text: "Orphaned output" }], timestamp: 3 } }]),
+					assistantEntry("answer", "A surviving answer does not prove the tool exchange"),
+					userEntry("kept", "Kept question"), compactionEntry("opaque", [RETAINED, SIGNED]), userEntry("tail", "Next question"),
+				]), version);
+			});
+		}
+	}
+
+	test("SEC P1: public recovery helpers reject dangling, absent, skipped and cyclic parents without repairing the input", () => {
+		for (const [id, parentId] of [
+			["u0", "missing-root"], ["a0", undefined], ["a0", "a0"], ["kept", "u0"], ["c1", "missing-checkpoint-parent"],
+		] as const) {
+			const branch = linkBranch(v2Branch());
+			branch.find((entry) => entry.id === id)!.parentId = parentId;
+			const original = JSON.stringify(branch);
+			const entry = branch.find((entry) => entry.id === "c1")!;
+			const payload = { model: model.id, instructions: "system prompt", input: [{ role: "developer", content: "fresh preamble" }] };
+			expect(isAffinityRebuildComplete(branch as never, model as never)).toBe(false);
+			expect(buildAffinitySafePayload(model as never, payload, branch as never, entry as never)).toEqual({ ok: false });
+			expect(() => buildAffinityRetiredSessionMessages(branch as never, model as never)).toThrow("Cannot recover every opaque Responses compaction");
+			expect(JSON.stringify(branch)).toBe(original);
+		}
+	});
+
+	test("a complete retain-none window and the next kept window recover through Pi without duplicating history", () => {
+		const branch = linkBranch([
+			userEntry("original", "Original question"), assistantEntry("original-answer", "Original answer"),
+			{ ...compactionEntry("retain-none", [SIGNED]), firstKeptEntryId: "retain-none" },
+			userEntry("middle", "Middle question"), assistantEntry("middle-answer", "Middle answer"),
+			userEntry("kept", "Kept question"), compactionEntry("c1", [SIGNED]), userEntry("tail", "Next question"),
+		]);
+		const original = JSON.stringify(branch);
+		expect(isAffinityRebuildComplete(branch as never, model as never)).toBe(true);
+		expect(buildAffinityRetiredSessionMessages(branch as never, model as never)).toEqual(contextMessages(branch.filter((entry) => entry.type !== "compaction")));
+		expect(JSON.stringify(branch)).toBe(original);
 	});
 
 	for (const windowCount of [2, 3]) {
@@ -581,6 +712,7 @@ describe("compaction affinity recovery", () => {
 	test("a retired v2 compaction without plain text and without a recognizable preamble fails closed, never Pi's payload", async () => {
 		const h = harness();
 		const branch: Array<Record<string, any>> = [
+			userEntry("u0", "Original question"), assistantEntry("a0", "Original answer"),
 			userEntry("kept", "kept"),
 			compactionEntry("c1", [RETAINED, SIGNED]),
 			{ type: "custom", id: "r1", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: "c1" } },
@@ -697,6 +829,8 @@ describe("compaction affinity recovery", () => {
 	test("unsupported user/tool-result images, even beside text, fail closed after exact affinity 409; image-capable recovery preserves image data", async () => {
 		const image = { type: "image", data: "YQ==", mimeType: "image/png" };
 		const imageBranch = (role: "user" | "toolResult", mixed: boolean): Array<Record<string, any>> => [
+			userEntry("original", "Original question with an image"),
+			...(role === "toolResult" ? [{ type: "message", id: "image-call", message: { role: "assistant", provider: model.provider, api: model.api, model: model.id, stopReason: "toolUse", content: [{ type: "toolCall", id: "image_call", name: "read", arguments: { path: "image.png" } }], timestamp: 1 } }] : []),
 			{ type: "message", id: "kept", timestamp: "2026-10-06T08:00:00.000Z", message: {
 				role, content: [...(mixed ? [{ type: "text", text: "image caption" }] : []), image], timestamp: 1,
 				...(role === "toolResult" ? { toolCallId: "image_call", toolName: "read", isError: false } : {}),
@@ -791,7 +925,7 @@ describe("compaction affinity recovery", () => {
 
 	test("with no plain text and a failed recompaction, the block is retired and the user is told to /compact or retry", async () => {
 		const h = harness(false);
-		const branch: Array<Record<string, any>> = [userEntry("kept", "kept"), compactionEntry("c1", [SIGNED]), userEntry("u2", "next")];
+		const branch: Array<Record<string, any>> = [userEntry("u0", "Original question"), assistantEntry("a0", "Original answer"), userEntry("kept", "kept"), compactionEntry("c1", [SIGNED]), userEntry("u2", "next")];
 		await h.call("before_provider_request", { payload: piPayload(branch) }, branch);
 		const boundary = await h.call("turn_end", turnEnd(AFFINITY_409), branch);
 		expect(boundary).toEqual({

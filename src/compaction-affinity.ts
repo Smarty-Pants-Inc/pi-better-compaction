@@ -84,13 +84,11 @@ function chainBranch(entries: readonly SessionEntry[]): SessionEntry[] {
 
 /** Role presence alone does not prove that the Responses serializer can recover history. */
 function hasRecoverableTranscript(messages: AgentMessage[], model?: Pick<Model<Api>, "input">): boolean {
-	// Convert Pi's custom messages and summaries exactly as the serializer does,
-	// but do not let the wrapper around an empty summary stand in for history.
-	const meaningfulSummaries = messages.filter((message) =>
-		(message.role !== "compactionSummary" && message.role !== "branchSummary") ||
-			(typeof message.summary === "string" && !!message.summary.trim()),
-	);
-	const llmMessages = convertToLlm(meaningfulSummaries);
+	// A summary (even a nonempty one) describes history; it is not the transcript
+	// that an opaque window replaced. Convert only genuine transcript messages.
+	const llmMessages = convertToLlm(messages.filter((message) =>
+		message.role !== "compactionSummary" && message.role !== "branchSummary",
+	));
 	// Reject partial recovery too: text beside an unsupported image cannot preserve history.
 	if (model && !model.input.includes("image") && llmMessages.some((message) =>
 		(message.role === "user" || message.role === "toolResult") && Array.isArray(message.content) &&
@@ -113,6 +111,77 @@ function hasRecoverableTranscript(messages: AgentMessage[], model?: Pick<Model<A
 	});
 }
 
+/** Never let the serializer manufacture a missing tool result or replay an orphan. */
+function hasCompleteToolPairs(messages: AgentMessage[]): boolean {
+	const calls = new Map<string, string>();
+	const pending = new Set<string>();
+	for (const message of convertToLlm(messages)) {
+		if (message.role === "toolResult") {
+			if (!pending.delete(message.toolCallId) || calls.get(message.toolCallId) !== message.toolName) return false;
+		} else {
+			// Responses inserts synthetic results if another message interrupts the
+			// tool batch. A later result does not make that exchange recoverable.
+			if (pending.size > 0) return false;
+			if (message.role !== "assistant") continue;
+			for (const block of message.content) {
+				if (block.type !== "toolCall") continue;
+				if (message.stopReason === "error" || message.stopReason === "aborted" || !block.id || calls.has(block.id)) return false;
+				calls.set(block.id, block.name);
+				pending.add(block.id);
+			}
+		}
+	}
+	return pending.size === 0;
+}
+
+/**
+ * Validate original parent links BEFORE chainBranch can repair them. Pi's next
+ * compaction window starts at the previous firstKeptEntryId (or session root),
+ * not at the previous checkpoint. Include the kept suffix up to the checkpoint:
+ * native Responses compaction also replaces assistant answers/tools in that suffix.
+ */
+function hasCoveredTranscriptWindow(
+	entries: readonly SessionEntry[],
+	index: number,
+	previousCompactionIndex: number | undefined,
+	positions: ReadonlyMap<string, number>,
+	model?: Pick<Model<Api>, "input">,
+): boolean {
+	const entry = entries[index] as CompactionEntry;
+	const boundary = positions.get(entry.firstKeptEntryId);
+	if (boundary === undefined || boundary > index) return false;
+	let start = 0;
+	if (previousCompactionIndex !== undefined) {
+		const previous = entries[previousCompactionIndex] as CompactionEntry;
+		const previousBoundary = positions.get(previous.firstKeptEntryId);
+		if (previousBoundary === undefined || previousBoundary > previousCompactionIndex) return false;
+		// Pi's retain-none sentinel is the checkpoint's own ID.
+		start = previousBoundary === previousCompactionIndex ? previousCompactionIndex + 1 : previousBoundary;
+	}
+	if (boundary < start || start >= index) return false;
+	if (previousCompactionIndex === undefined) {
+		if (entries[start]!.parentId !== null) return false;
+	} else if (start === previousCompactionIndex + 1 && entries[start]!.parentId !== entries[previousCompactionIndex]!.id) {
+		return false;
+	}
+	// The previous kept entry is the trusted start anchor; everything after
+	// it, including this checkpoint's parent, must be the original chain.
+	for (let at = start + 1; at <= index; at++) {
+		if (entries[at]!.parentId !== entries[at - 1]!.id) return false;
+	}
+	const transcript = entries.slice(start, index).filter((candidate) =>
+		candidate.type !== "compaction" && candidate.type !== "branch_summary",
+	);
+	// Check the stored exchange too: an edit cannot conceal a lost tool result.
+	const rawMessages = buildSessionContext(chainBranch(transcript.filter((candidate) => candidate.type !== "context_edit"))).messages;
+	if (!hasCompleteToolPairs(rawMessages)) return false;
+	const messages = buildSessionContext(chainBranch(transcript)).messages;
+	if (!hasRecoverableTranscript(messages, model)) return false;
+	// The retained boundary's existence/content is not evidence of replaced
+	// history. Require genuine transcript elsewhere in this particular window.
+	return hasRecoverableTranscript(buildSessionContext(chainBranch(transcript.filter((candidate) => candidate.id !== entry.firstKeptEntryId))).messages, model);
+}
+
 /**
  * Expand Responses checkpoints oldest-first, using Pi's projector, not the opaque
  * retained items (which cannot recover assistant answers or tool results).
@@ -122,17 +191,20 @@ function hasRecoverableTranscript(messages: AgentMessage[], model?: Pick<Model<A
  */
 function rebuildAffinityBranch(entries: readonly SessionEntry[], model?: Pick<Model<Api>, "input">): SessionEntry[] | undefined {
 	const rebuilt: SessionEntry[] = [];
-	const seen = new Set<string>();
-	for (const entry of entries) {
-		if (seen.has(entry.id)) return undefined;
+	const positions = new Map<string, number>();
+	let previousCompactionIndex: number | undefined;
+	let expanded = false;
+	for (const [index, entry] of entries.entries()) {
+		if (!entry.id || positions.has(entry.id)) return undefined;
+		positions.set(entry.id, index);
 		if (isResponsesNativeCompaction(entry)) {
-			const boundaryPresent = seen.has(entry.firstKeptEntryId);
 			// A single plain checkpoint needs no reconstruction, even when an import
 			// retains only its kept window. Keep its summary for later /compact too.
-			const transcriptPresent = !canUseAffinityPlainSummary(entries, entry) && boundaryPresent &&
-				hasRecoverableTranscript(buildSessionContext(chainBranch(rebuilt)).messages, model);
+			const transcriptPresent = !canUseAffinityPlainSummary(entries, entry) &&
+				hasCoveredTranscriptWindow(entries, index, previousCompactionIndex, positions, model);
 			if (!transcriptPresent && !hasPlainSummary(entry)) return undefined;
 			if (transcriptPresent) {
+				expanded = true;
 				// Keep the ID as a context-free anchor: a later nonnative summary may
 				// use this checkpoint as firstKeptEntryId. No signed item or placeholder
 				// reaches Pi's projector, and the original chronology remains intact.
@@ -146,9 +218,16 @@ function rebuildAffinityBranch(entries: readonly SessionEntry[], model?: Pick<Mo
 		} else {
 			rebuilt.push(entry);
 		}
-		seen.add(entry.id);
+		if (entry.type === "compaction") previousCompactionIndex = index;
 	}
-	return chainBranch(rebuilt);
+	const branch = chainBranch(rebuilt);
+	if (expanded) {
+		// Apply all later context edits/nonnative summaries through Pi once, then
+		// ensure the actual serialized transcript still has complete exchanges.
+		const messages = buildSessionContext(branch).messages;
+		if (!hasCompleteToolPairs(messages) || !hasRecoverableTranscript(messages, model)) return undefined;
+	}
+	return branch;
 }
 
 export function isAffinityRebuildComplete(entries: readonly SessionEntry[], model?: Pick<Model<Api>, "input">): boolean {
