@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { executeV2Compaction, type V2CompactionResult } from "./compact-client-v2";
 import { buildResponsesUrl } from "./runtime";
+import { serializeMessagesToResponsesInput } from "./serializer";
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -152,6 +153,43 @@ describe("executeV2Compaction", () => {
 		const input = requestBody.input as unknown[];
 		expect(input[input.length - 1]).toEqual({ type: "compaction_trigger" });
 		expect(input.length).toBe(2); // original + compaction_trigger
+	});
+
+	test("Codex V2 sends function-call history without custom-tool item IDs", async () => {
+		let requestBody: Record<string, unknown> = {};
+		globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+			requestBody = JSON.parse(String(init?.body));
+			return sseResponse([compactionOutputItemDone("blob"), responseCompleted()]);
+		}) as typeof fetch;
+		const model = {
+			...baseModel, provider: "openai-codex", api: "openai-codex-responses", id: "gpt-6.1-sol",
+			baseUrl: "https://chatgpt.com/backend-api",
+		};
+		const input = serializeMessagesToResponsesInput(model as never, [
+			{
+				role: "assistant", provider: model.provider, api: model.api, model: model.id,
+				stopReason: "toolUse", timestamp: 1,
+				content: [{ type: "toolCall", id: "call_1|ctc_codemode", name: "codemode", arguments: { code: "return 1;" } }],
+			},
+			{
+				role: "toolResult", toolCallId: "call_1|ctc_codemode", toolName: "codemode",
+				content: [{ type: "text", text: "1" }], isError: false, timestamp: 2,
+			},
+		] as never);
+		const result = await executeV2Compaction({
+			runtime: createRuntime({
+				provider: model.provider, api: model.api, model: model.id, currentModel: model,
+				responsesUrl: buildResponsesUrl(model.baseUrl, model.api),
+			}),
+			request: { ...createRequest(input), model: model.id },
+			maxRetries: 0,
+		});
+		expect(result.ok).toBe(true);
+		expect(requestBody.input).toEqual([
+			{ type: "function_call", call_id: "call_1", name: "codemode", arguments: '{"code":"return 1;"}' },
+			{ type: "function_call_output", call_id: "call_1", output: "1" },
+			{ type: "compaction_trigger" },
+		]);
 	});
 
 	test("sends request to responsesUrl, not compactUrl", async () => {

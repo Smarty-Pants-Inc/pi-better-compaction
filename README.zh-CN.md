@@ -2,10 +2,11 @@
 
 [English](README.md) | 中文
 
-一个 [pi](https://github.com/nicepkg/pi) 扩展，通过两条协同策略提升上下文压缩效果：
+一个 [pi](https://github.com/nicepkg/pi) 扩展，通过三条协同策略提升上下文压缩效果：
 
 1. **OpenAI Responses 系列 API** 使用提供商原生压缩端点，保留纯文本摘要无法留存的不透明上下文。
-2. **其他所有 API**（Anthropic、Gemini 等）可用一个**独立的低成本模型**执行 pi 内置压缩，避免在主模型上消耗额度。
+2. **Anthropic Messages API** 使用 Anthropic 服务端按需压缩（beta `compact-2026-09-04`），并回放带签名的压缩块。
+3. **其他所有 API**（Gemini 等）可用一个**独立的低成本模型**执行 pi 内置压缩，避免在主模型上消耗额度。
 
 所有环节都安全降级——任何步骤无法执行时，pi 的默认压缩自动接管。
 
@@ -102,10 +103,19 @@ pi 触发压缩时（`session_before_compact`）：
    - **V2**：向 `/responses` 端点发送携带 `compaction_trigger` 的流式请求，API 返回加密压缩 blob。保留的用户/开发者消息 + blob 组成压缩后的上下文。
    - **V1**：POST 到 `/responses/compact`，接收不透明的压缩窗口。
    - 成功后，压缩窗口被存储，后续请求通过 `before_provider_request` 钩子回放。
+   - 回放要求提供商、API 和模型与创建压缩窗口时一致。如果最近一次压缩只有占位摘要（V2 总是如此，V1 未提取到文本摘要时也如此），选择不兼容的模型会显示警告：该模型只能看到保留的消息，可通过 `/tree` 从第一次不兼容压缩之前的条目创建分支；只回到最近一次压缩之前，可能仍有更早的不透明检查点。当前会话内，每个压缩检查点与模型组合只提醒一次；有可读摘要时不提醒。此警告不比较配置中的基础 URL，避免 OAuth 动态解析端点造成误报。
 
-2. **非 Responses API，或原生压缩失败** → 若配置了 `compactionModel` 且与当前模型不同，使用该模型执行 pi 内置的 `compact()` 方法。
+2. **Anthropic Messages API**（`anthropic-messages`）→ 使用 Pi 序列化的请求，将本次要丢弃的消息发送到服务端，携带 `compaction: {type: "summarize"}` 和 `compact-2026-09-04` beta：
+   - 响应中的带签名 `compaction` 块存入压缩条目的 `details`，按提供商、API、模型和基础 URL 匹配。块中的文本同时作为 Pi 的摘要。
+   - 后续使用同一提供商和模型时，用原始压缩块替换 Pi 的摘要消息；Pi 保留的消息不变。
+   - 切换提供商或模型后改用文本摘要，不向其他提供商或模型发送压缩块。
+   - 如果提供商对携带压缩块的请求返回 HTTP 400，该块会在当前会话中停用，后续使用文本摘要。
+   - 某些网关（如使用 Claude 订阅的 CLIProxyAPI）会向启用 thinking 的请求注入 `context_management`，而 Anthropic 不允许它与 `compaction` 同时出现。仅遇到这一特定的 HTTP 400 时，扩展会移除请求的 thinking 参数重试一次。历史中的 thinking 块保留，后续对话的思考级别不变。
+   - 压缩阈值仍由 Pi 的 `compaction` 设置控制。
 
-3. **未配置回退模型** → pi 的默认压缩照常执行，如同扩展未安装。
+3. **非原生 API，或原生压缩失败** → 若配置了 `compactionModel` 且与当前模型不同，使用该模型执行 pi 内置的 `compact()` 方法。
+
+4. **未配置回退模型** → pi 的默认压缩照常执行，如同扩展未安装。
 
 判断依据是 API 类型而非提供商——任何使用 Responses API 协议的 OpenAI 兼容代理都会触发原生压缩尝试。如果端点不支持，请求失败后自动回退。
 
