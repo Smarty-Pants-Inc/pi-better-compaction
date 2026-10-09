@@ -371,6 +371,97 @@ describe("compaction affinity recovery", () => {
 		}
 	}
 
+	/** Neither a readable native summary nor its checkpoint metadata proves coverage. */
+	function summarizedTwoWindowBranch(
+		gap: "missing-boundary" | "broken-chain",
+		damagedWindow: "earlier" | "latest" = "earlier",
+		strategy: typeof NATIVE_COMPACTION_STRATEGY | typeof NATIVE_COMPACTION_STRATEGY_V2 = NATIVE_COMPACTION_STRATEGY_V2,
+	): Array<Record<string, any>> {
+		const branch = linkBranch([
+			userEntry("original", "Original question"), assistantEntry("original-answer", "Original answer"),
+			userEntry("middle", "Middle question"),
+			{ ...compactionEntry("c0", [SIGNED], "Nonblank earlier summary is not transcript evidence."), firstKeptEntryId: "middle" },
+			assistantEntry("middle-answer", "Middle answer"), userEntry("kept", "Retained boundary survives"),
+			compactionEntry("c1", [RETAINED, SIGNED], "Nonblank latest summary is not transcript evidence."),
+			userEntry("tail", "Next question"),
+		]);
+		for (const entry of branch.filter((entry) => entry.type === "compaction")) entry.details.strategy = strategy;
+		if (gap === "missing-boundary") {
+			branch.find((entry) => entry.id === (damagedWindow === "earlier" ? "c0" : "c1"))!.firstKeptEntryId = "missing-original";
+		} else {
+			branch.find((entry) => entry.id === (damagedWindow === "earlier" ? "original-answer" : "middle-answer"))!.parentId = "missing-original-parent";
+		}
+		return branch;
+	}
+
+	for (const gap of ["missing-boundary", "broken-chain"] as const) {
+		for (const version of ["v1", "v2"] as const) {
+			test(`SEC P1 round 3 ${version}: ${gap} with nonblank summaries blocks recovery, resend and recompaction`, async () => {
+				for (const strategy of [NATIVE_COMPACTION_STRATEGY, NATIVE_COMPACTION_STRATEGY_V2]) {
+					await expectGapBlocked(summarizedTwoWindowBranch(gap, "earlier", strategy), version);
+				}
+			});
+
+			for (const path of ["before_provider_request", "session_before_compact"] as const) {
+				test(`SEC P1 round 3 ${version}: persisted retirement with ${gap} and nonblank summaries blocks ${path} independently`, async () => {
+					for (const damagedWindow of ["earlier", "latest"] as const) {
+						for (const strategy of [NATIVE_COMPACTION_STRATEGY, NATIVE_COMPACTION_STRATEGY_V2]) {
+							const h = harness(true, version);
+							const branch = summarizedTwoWindowBranch(gap, damagedWindow, strategy);
+							branch.push({ type: "custom", id: "retired", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: "c1" } });
+							const before = JSON.stringify(linkBranch(branch));
+							if (path === "before_provider_request") {
+								const blocked = await h.call(path, { payload: piPayload(branch) }, branch) as { input: unknown[] };
+								expect(blocked.input).toEqual([]);
+								expect(h.aborts).toHaveLength(1);
+							} else {
+								expect(await h.call(path, {
+									signal: new AbortController().signal,
+									preparation: { tokensBefore: 1, firstKeptEntryId: "tail", messagesToSummarize: [], turnPrefixMessages: [] },
+								}, branch)).toEqual({ cancel: true });
+							}
+							expect(JSON.stringify(branch)).toBe(before);
+							expect(h.v1Calls).toHaveLength(0);
+							expect(h.v2Calls).toHaveLength(0);
+							expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+							const errors = h.notes.filter((note) => note.level === "error");
+							expect(errors).toHaveLength(1);
+							expect(errors[0]!.text).toContain("/new");
+							expect(errors[0]!.text).toContain("/tree");
+							expect(errors[0]!.text).not.toContain("/compact");
+						}
+					}
+				});
+			}
+		}
+
+		test(`SEC P1 round 3: public helpers reject ${gap} despite summaries, retirement markers and checkpoint fields`, () => {
+			for (const damagedWindow of ["earlier", "latest"] as const) {
+				for (const strategy of [NATIVE_COMPACTION_STRATEGY, NATIVE_COMPACTION_STRATEGY_V2]) {
+					for (const concealWith of ["nothing", "retirement", "branch-summary", "nonnative-summary"] as const) {
+						const branch = summarizedTwoWindowBranch(gap, damagedWindow, strategy);
+						const entry = branch.find((entry) => entry.id === "c1")!;
+						entry.details.compactResponseId = "resp_replayed";
+						entry.details.requestMeta = { tokensBefore: 200_000, previousSummaryPresent: true };
+						if (concealWith === "retirement") {
+							branch.push({ type: "custom", id: "retired", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: "c0" } });
+						} else if (concealWith === "branch-summary") {
+							branch.push({ type: "branch_summary", id: "later", fromId: "abandoned", summary: "A later branch summary cannot conceal a gap." });
+						} else if (concealWith === "nonnative-summary") {
+							branch.push({ ...compactionEntry("later", [], "A later nonnative summary cannot conceal a gap."), firstKeptEntryId: "tail", details: undefined });
+						}
+						const before = JSON.stringify(linkBranch(branch));
+						const payload = piPayload(branch);
+						expect(isAffinityRebuildComplete(branch as never, model as never)).toBe(false);
+						expect(buildAffinitySafePayload(model as never, payload, branch as never, entry as never)).toEqual({ ok: false });
+						expect(() => buildAffinityRetiredSessionMessages(branch as never, model as never)).toThrow("Cannot recover every opaque Responses compaction");
+						expect(JSON.stringify(branch)).toBe(before);
+					}
+				}
+			}
+		});
+	}
+
 	for (const version of ["v1", "v2"] as const) {
 		test(`SEC P1 ${version}: truncated pre-boundary transcript with a surviving earlier summary blocks visibly without sending`, async () => {
 			const full = linkBranch([

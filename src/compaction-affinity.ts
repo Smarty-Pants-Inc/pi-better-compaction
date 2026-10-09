@@ -185,9 +185,9 @@ function hasCoveredTranscriptWindow(
 /**
  * Expand Responses checkpoints oldest-first, using Pi's projector, not the opaque
  * retained items (which cannot recover assistant answers or tool results).
- * Plain summaries remain usable when an imported branch has no original transcript.
- * Every opaque checkpoint is checked, even one already retired or hidden by a later
- * summary: a retirement marker is not proof that its transcript exists.
+ * Only the pre-existing single-window plain-summary shortcut may skip reconstruction.
+ * Every other Responses checkpoint needs covered transcript, regardless of summary,
+ * retirement markers or later summaries: none proves that its transcript exists.
  */
 function rebuildAffinityBranch(entries: readonly SessionEntry[], model?: Pick<Model<Api>, "input">): SessionEntry[] | undefined {
 	const rebuilt: SessionEntry[] = [];
@@ -200,10 +200,10 @@ function rebuildAffinityBranch(entries: readonly SessionEntry[], model?: Pick<Mo
 		if (isResponsesNativeCompaction(entry)) {
 			// A single plain checkpoint needs no reconstruction, even when an import
 			// retains only its kept window. Keep its summary for later /compact too.
-			const transcriptPresent = !canUseAffinityPlainSummary(entries, entry) &&
-				hasCoveredTranscriptWindow(entries, index, previousCompactionIndex, positions, model);
-			if (!transcriptPresent && !hasPlainSummary(entry)) return undefined;
-			if (transcriptPresent) {
+			const usePlainSummary = canUseAffinityPlainSummary(entries, entry);
+			// Outside that legacy shortcut, a summary can never override failed coverage.
+			if (!usePlainSummary && !hasCoveredTranscriptWindow(entries, index, previousCompactionIndex, positions, model)) return undefined;
+			if (!usePlainSummary) {
 				expanded = true;
 				// Keep the ID as a context-free anchor: a later nonnative summary may
 				// use this checkpoint as firstKeptEntryId. No signed item or placeholder
