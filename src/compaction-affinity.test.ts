@@ -3,7 +3,7 @@ import { buildSessionContext } from "@earendil-works/pi-coding-agent";
 import { COMPACTION_AFFINITY_RETIRED_ENTRY, isCompactionAffinityMissing } from "./compaction-affinity";
 import { registerExtensionRuntime } from "./extension-runtime";
 import { serializeMessagesToResponsesInput } from "./serializer";
-import { DEFAULT_EXTENSION_CONFIG, NATIVE_COMPACTION_FALLBACK_SUMMARY, NATIVE_COMPACTION_STRATEGY_V2, createNativeCompactionDetails } from "./types";
+import { DEFAULT_EXTENSION_CONFIG, NATIVE_COMPACTION_FALLBACK_SUMMARY, NATIVE_COMPACTION_STRATEGY, NATIVE_COMPACTION_STRATEGY_V2, createNativeCompactionDetails } from "./types";
 
 const model = {
 	provider: "cliproxyapi",
@@ -320,14 +320,186 @@ describe("compaction affinity recovery", () => {
 		expect(h.toolExecutions).toHaveLength(0);
 	});
 
-	test("consecutive v2: a 409 on the second compaction after an earlier placeholder one fails closed: no recompaction, no resend, error shown", async () => {
+	for (const windowCount of [2, 3]) {
+		test(`consecutive v2: ${windowCount} compactions recover all transcript windows oldest-first exactly once and reset only on the next prompt`, async () => {
+			const h = harness();
+			const labels = windowCount === 2 ? ["oldest", "middle", "latest"] : ["oldest", "middle", "latest", "tail"];
+			const branch: Array<Record<string, any>> = [userEntry("u-oldest", "oldest question")];
+			const oldBlobs: string[] = [];
+			for (const [index, label] of labels.entries()) {
+				const call = { type: "toolCall", id: `call_${label}|fc_${label}`, name: "read", arguments: { path: `${label}.ts` } };
+				branch.push(
+					{ type: "message", id: `tool-call-${label}`, message: { role: "assistant", provider: model.provider, api: model.api, model: model.id, stopReason: "toolUse", content: [call], timestamp: 2 } },
+					{ type: "message", id: `tool-result-${label}`, message: { role: "toolResult", toolCallId: call.id, toolName: "read", isError: false, content: [{ type: "text", text: `${label} file body` }], timestamp: 3 } },
+					assistantEntry(`answer-${label}`, `${label} assistant answer`),
+				);
+				if (index < windowCount) {
+					const nextLabel = labels[index + 1]!;
+					const blob = `gAAAA-old-${label}`;
+					oldBlobs.push(blob);
+					// Each kept user overlaps the next window. Reconstruction must not replay it twice.
+					branch.push(
+						userEntry(`u-${nextLabel}`, `${nextLabel} question`),
+						{ ...compactionEntry(`c${index}`, [{ role: "user", content: [{ type: "input_text", text: `${nextLabel} question` }] }, { ...SIGNED, id: `cmp_${index}`, encrypted_content: blob }]), firstKeptEntryId: `u-${nextLabel}` },
+					);
+				}
+			}
+			// Independent oracle: Pi's real context for the original, uncompacted transcript.
+			const expectedInput = serializeMessagesToResponsesInput(model as never, contextMessages(branch.filter((entry) => entry.type !== "compaction")) as never);
+			const first = await h.call("before_provider_request", { payload: piPayload(branch) }, branch);
+			expect(JSON.stringify(first)).toContain(oldBlobs.at(-1)!);
+			branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
+			const boundary = (await h.call("turn_end", turnEnd(AFFINITY_409), branch)) as { entries: Array<Record<string, any>> };
+
+			expect(h.v2Calls).toHaveLength(1);
+			expect(h.v1Calls).toHaveLength(0);
+			expect(h.v2Calls[0]).toMatchObject({ runtime: { model: model.id, baseUrl: model.baseUrl, apiKey: "sk-test" } });
+			const input = h.v2Calls[0]!.request.input as Array<Record<string, any>>;
+			expect(input).toEqual(expectedInput);
+			// Assert values and pairing, not merely presence: no duplicate/missing/reordered history.
+			expect(input.map((item) => item.type === "function_call" ? `call:${item.call_id}` : item.type === "function_call_output" ? `result:${item.call_id}:${item.output}` : `${item.role}:${item.content[0].text}`)).toEqual(
+				labels.flatMap((label) => [`user:${label} question`, `call:call_${label}`, `result:call_${label}:${label} file body`, `assistant:${label} assistant answer`]),
+			);
+			const recompactText = JSON.stringify(input);
+			expect(recompactText).not.toContain(NATIVE_COMPACTION_FALLBACK_SUMMARY);
+			expect(recompactText).not.toContain("No result provided");
+			expect(hasSignedItem(h.v2Calls[0]!.request)).toBe(false);
+			for (const blob of oldBlobs) expect(recompactText).not.toContain(blob);
+			expect(boundary.entries.filter((entry) => entry.type === "context_edit")).toEqual([{ type: "context_edit", targetId: "failed", replacement: null }]);
+			expect(boundary.entries.filter((entry) => entry.type === "compaction")).toHaveLength(1);
+			expect(JSON.stringify(boundary.entries.find((entry) => entry.type === "compaction")!.details.compactedWindow)).toContain(FRESH.encrypted_content);
+			commit(branch, boundary);
+			expect(await h.call("agent_before_settle", {}, branch)).toEqual({ continue: true });
+			expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+			const resend = (await h.call("before_provider_request", { payload: piPayload(branch) }, branch)) as { input: Array<Record<string, any>> };
+			expect(resend.input).toEqual([{ role: "developer", content: "fresh preamble" }, ...expectedInput.filter((item) => "role" in item && item.role === "user"), FRESH]);
+			const resendText = JSON.stringify(resend);
+			for (const blob of oldBlobs) expect(resendText).not.toContain(blob);
+			expect(resendText).not.toContain(NATIVE_COMPACTION_FALLBACK_SUMMARY);
+			expect(h.aborts).toHaveLength(0);
+			expect(h.toolExecutions).toHaveLength(0);
+
+			// The fresh blob can also get a 409: the same prompt must not loop.
+			branch.push({ type: "message", id: "failed-again", message: errorTurn(AFFINITY_409) });
+			expect(await h.call("turn_end", { ...turnEnd(AFFINITY_409), messageEntryId: "failed-again" }, branch)).toBeUndefined();
+			expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+			expect(h.v2Calls).toHaveLength(1);
+			expect(h.notes.filter((note) => note.text.includes("already-recovered"))).toHaveLength(1);
+
+			await h.call("before_agent_start", { prompt: "new prompt" }, branch);
+			branch.push(userEntry("new-prompt", "new prompt"));
+			expect(hasSignedItem(await h.call("before_provider_request", { payload: piPayload(branch) }, branch))).toBe(true);
+			branch.push({ type: "message", id: "failed-next", message: errorTurn(AFFINITY_409) });
+			const nextBoundary = await h.call("turn_end", { ...turnEnd(AFFINITY_409), messageEntryId: "failed-next" }, branch);
+			expect(h.v2Calls).toHaveLength(2);
+			expect(h.v2Calls[1]!.request.input).toEqual([...expectedInput, { role: "user", content: [{ type: "input_text", text: "new prompt" }] }]);
+			commit(branch, nextBoundary);
+			expect(await h.call("agent_before_settle", {}, branch)).toEqual({ continue: true });
+			expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+			const nextResend = (await h.call("before_provider_request", { payload: piPayload(branch) }, branch)) as { input: unknown[] };
+			expect(nextResend.input).toEqual([{ role: "developer", content: "fresh preamble" }, ...expectedInput.filter((item) => "role" in item && item.role === "user"), { role: "user", content: [{ type: "input_text", text: "new prompt" }] }, FRESH]);
+			expect(h.v2Calls).toHaveLength(2);
+			expect(h.aborts).toHaveLength(0);
+			expect(h.notes.filter((note) => note.level === "warning" && note.text.includes("compaction-affinity-recovery: "))).toHaveLength(2);
+		});
+	}
+
+	for (const latestVersion of ["v2", "v1"] as const) {
+		test(`consecutive ${latestVersion === "v1" ? "v2 then v1" : "v2"}: multi-window recovery preserves older assistant and tool-result replacements and omitted messages`, async () => {
+			const h = harness();
+			const call = { type: "toolCall", id: "call_edited|fc_edited", name: "read", arguments: { path: "older.ts" } };
+			const latest = compactionEntry("c1", [RETAINED, SIGNED], latestVersion === "v1" ? "Latest plain summary cannot replace the older V2 history." : NATIVE_COMPACTION_FALLBACK_SUMMARY);
+			if (latestVersion === "v1") latest.details = { ...latest.details, strategy: NATIVE_COMPACTION_STRATEGY };
+			const branch: Array<Record<string, any>> = [
+				userEntry("u0", "oldest question"),
+				{ type: "message", id: "old-call", message: { role: "assistant", provider: model.provider, api: model.api, model: model.id, stopReason: "toolUse", content: [call], timestamp: 2 } },
+				{ type: "message", id: "old-result", message: { role: "toolResult", toolCallId: call.id, toolName: "read", isError: false, content: [{ type: "text", text: "original obsolete tool result" }], timestamp: 3 } },
+				assistantEntry("old-answer", "original obsolete assistant answer"),
+				assistantEntry("omitted", "message removed from context"),
+				userEntry("middle", "middle question"),
+				{ ...compactionEntry("c0", [{ ...SIGNED, encrypted_content: "gAAAA-older-edited" }]), firstKeptEntryId: "middle" },
+				assistantEntry("middle-answer", "middle assistant answer"),
+				userEntry("kept", "kept"),
+				latest,
+				userEntry("latest", "latest question"),
+				// Edits appended after both checkpoints still govern the reconstructed oldest window.
+				{ type: "context_edit", id: "replace-answer", targetId: "old-answer", replacement: { content: [{ type: "text", text: "corrected older assistant answer" }] } },
+				{ type: "context_edit", id: "replace-result", targetId: "old-result", replacement: { content: [{ type: "text", text: "corrected older tool result" }] } },
+				{ type: "context_edit", id: "omit-message", targetId: "omitted", replacement: null },
+			];
+			const expectedInput = serializeMessagesToResponsesInput(model as never, contextMessages(branch.filter((entry) => entry.type !== "compaction")) as never);
+			expect(hasSignedItem(await h.call("before_provider_request", { payload: piPayload(branch) }, branch))).toBe(true);
+			branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
+			const boundary = (await h.call("turn_end", turnEnd(AFFINITY_409), branch)) as { entries: Array<Record<string, any>> };
+			expect(h.v2Calls).toHaveLength(1);
+			expect(h.v1Calls).toHaveLength(0);
+			const input = h.v2Calls[0]!.request.input as Array<Record<string, any>>;
+			expect(input).toEqual(expectedInput);
+			expect(input.filter((item) => item.role === "assistant").map((item) => item.content[0].text)).toEqual(["corrected older assistant answer", "middle assistant answer"]);
+			expect(input.filter((item) => item.type === "function_call")).toEqual([{ type: "function_call", id: "fc_edited", call_id: "call_edited", name: "read", arguments: JSON.stringify(call.arguments) }]);
+			expect(input.filter((item) => item.type === "function_call_output")).toEqual([{ type: "function_call_output", call_id: "call_edited", output: "corrected older tool result" }]);
+			const text = JSON.stringify(input);
+			for (const absent of ["original obsolete", "message removed from context", "gAAAA-older-edited", SIGNED.encrypted_content, NATIVE_COMPACTION_FALLBACK_SUMMARY, "Latest plain summary", "No result provided"]) expect(text).not.toContain(absent);
+			expect(boundary.entries.filter((entry) => entry.type === "context_edit")).toEqual([{ type: "context_edit", targetId: "failed", replacement: null }]);
+			expect(boundary.entries.filter((entry) => entry.type === "compaction")).toHaveLength(1);
+			commit(branch, boundary);
+			expect(await h.call("agent_before_settle", {}, branch)).toEqual({ continue: true });
+			expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+			const resend = (await h.call("before_provider_request", { payload: piPayload(branch) }, branch)) as { input: unknown[] };
+			expect(resend.input).toEqual([{ role: "developer", content: "fresh preamble" }, ...expectedInput.filter((item) => "role" in item && item.role === "user"), FRESH]);
+			expect(h.v2Calls).toHaveLength(1);
+			expect(h.aborts).toHaveLength(0);
+		});
+	}
+
+	test("consecutive v2: a retired earlier opaque checkpoint without its original transcript fails closed before recompaction or resend", async () => {
 		const h = harness();
 		const branch: Array<Record<string, any>> = [
-			userEntry("u0", "Remember: the codename is HERON-7."),
-			assistantEntry("a0", "Noted. The cat is called Biscuit."),
+			// Imported/truncated branch: neither the summarized messages nor the kept entry exist.
+			{ ...compactionEntry("opaque", [{ ...SIGNED, encrypted_content: "gAAAA-opaque-retired" }]), firstKeptEntryId: "missing-original" },
+			{ type: "custom", id: "retired-opaque", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: "opaque" } },
+			userEntry("middle", "middle question"),
+			assistantEntry("middle-answer", "middle answer"),
 			userEntry("kept", "kept"),
-			// The earlier native compaction: its history lives only in its own signed item.
-			compactionEntry("c0", [RETAINED, { ...SIGNED, id: "cmp_0", encrypted_content: "gAAAA-older-signed" }]),
+			compactionEntry("c1", [RETAINED, SIGNED]),
+			userEntry("latest", "latest question"),
+		];
+		expect(hasSignedItem(await h.call("before_provider_request", { payload: piPayload(branch) }, branch))).toBe(true);
+		branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
+		const boundary = (await h.call("turn_end", turnEnd(AFFINITY_409), branch)) as { entries: Array<Record<string, any>> };
+		expect(h.v2Calls).toHaveLength(0);
+		expect(h.v1Calls).toHaveLength(0);
+		expect(boundary.entries.some((entry) => entry.type === "compaction" || entry.type === "context_edit")).toBe(false);
+		expect(boundary.entries).toContainEqual({ type: "custom", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: "c1" } });
+		expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+		commit(branch, boundary);
+		await h.call("before_agent_start", { prompt: "retry" }, branch);
+		branch.push(userEntry("retry", "retry"));
+		const blocked = (await h.call("before_provider_request", { payload: piPayload(branch) }, branch)) as { input: unknown[] };
+		expect(blocked.input).toEqual([]);
+		expect(h.aborts).toHaveLength(1);
+		expect(JSON.stringify(blocked)).not.toContain(SIGNED.encrypted_content);
+		expect(JSON.stringify(blocked)).not.toContain("gAAAA-opaque-retired");
+		expect(JSON.stringify(blocked)).not.toContain(NATIVE_COMPACTION_FALLBACK_SUMMARY);
+		expect(await h.call("session_before_compact", { signal: new AbortController().signal, preparation: { tokensBefore: 1, firstKeptEntryId: "retry", messagesToSummarize: [], turnPrefixMessages: [] } }, branch)).toEqual({ cancel: true });
+		expect(h.v2Calls).toHaveLength(0);
+		expect(h.v1Calls).toHaveLength(0);
+		expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+		const errors = h.notes.filter((note) => note.level === "error");
+		expect(errors).toHaveLength(3);
+		for (const error of errors) {
+			expect(error.text).not.toContain("/compact");
+			expect(error.text).toContain("/new");
+			expect(error.text).toContain("/tree");
+		}
+	});
+
+	test("consecutive v2: a 409 with an earlier window that has no recoverable transcript fails closed: no recompaction, no resend, error shown", async () => {
+		const h = harness();
+		const branch: Array<Record<string, any>> = [
+			// The earlier checkpoint was imported without its original transcript or kept entry.
+			{ ...compactionEntry("c0", [RETAINED, { ...SIGNED, id: "cmp_0", encrypted_content: "gAAAA-older-signed" }]), firstKeptEntryId: "missing-original" },
+			userEntry("kept", "kept"),
 			userEntry("u1", "middle question"),
 			assistantEntry("a1", "Middle answer: the dog is called Juniper."),
 			{ ...compactionEntry("c1", [RETAINED, SIGNED]), firstKeptEntryId: "u1" },
@@ -337,8 +509,7 @@ describe("compaction affinity recovery", () => {
 		branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
 		const boundary = await h.call("turn_end", turnEnd(AFFINITY_409), branch);
 
-		// Retiring c1 leaves c0's placeholder in force, so the rebuilt context is incomplete:
-		// c1 is retired, nothing is recompacted and nothing is resent.
+		// c0's original window cannot be rebuilt, so retiring c1 must not bless truncated history.
 		expect(boundary).toEqual({
 			entries: [{ type: "custom", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: "c1" } }],
 		});
@@ -370,10 +541,9 @@ describe("compaction affinity recovery", () => {
 		test(`consecutive ${compactionVersion}: /compact after the blocked 409 is cancelled, history untouched, no /compact advice`, async () => {
 			const h = harness(true, compactionVersion);
 			const branch: Array<Record<string, any>> = [
-				userEntry("u0", "Remember: the codename is HERON-7."),
-				assistantEntry("a0", "Noted. The cat is called Biscuit."),
+				// A genuinely missing earlier window, not a recoverable native placeholder.
+				{ ...compactionEntry("c0", [RETAINED, { ...SIGNED, id: "cmp_0", encrypted_content: "gAAAA-older-signed" }]), firstKeptEntryId: "missing-original" },
 				userEntry("kept", "kept"),
-				compactionEntry("c0", [RETAINED, { ...SIGNED, id: "cmp_0", encrypted_content: "gAAAA-older-signed" }]),
 				userEntry("u1", "middle question"),
 				assistantEntry("a1", "Middle answer: the dog is called Juniper."),
 				{ ...compactionEntry("c1", [RETAINED, SIGNED]), firstKeptEntryId: "u1" },
@@ -384,7 +554,7 @@ describe("compaction affinity recovery", () => {
 			commit(branch, await h.call("turn_end", turnEnd(AFFINITY_409), branch));
 			const before = JSON.stringify(branch);
 
-			// The rebuilt context still holds c0's placeholder: compacting it would lose that history for good.
+			// c0's original transcript is absent: compacting the truncated context would lose history.
 			const result = await h.call(
 				"session_before_compact",
 				{

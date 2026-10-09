@@ -9,7 +9,13 @@ import {
 import { extractFreshAuthoritativePreamble } from "./payload-rewrite";
 import type { ResponsesCompatibleRequestPayload } from "./runtime";
 import { serializeMessagesToResponsesInput } from "./serializer";
-import { NATIVE_COMPACTION_FALLBACK_SUMMARY, isNativeCompactionEntry, type NativeCompactionEntry } from "./types";
+import {
+	NATIVE_COMPACTION_FALLBACK_SUMMARY,
+	NATIVE_COMPACTION_STRATEGY,
+	NATIVE_COMPACTION_STRATEGY_V2,
+	isNativeCompactionEntry,
+	type NativeCompactionEntry,
+} from "./types";
 
 /**
  * Custom session entry recorded when the gateway answers 409 `compaction_affinity_missing`:
@@ -60,36 +66,80 @@ export function hasPlainSummary(entry: NativeCompactionEntry): boolean {
 	return !!summary && summary !== NATIVE_COMPACTION_FALLBACK_SUMMARY;
 }
 
+/** Only Responses checkpoints belong to the gateway's account-affinity recovery. */
+function isResponsesNativeCompaction(entry: SessionEntry): entry is NativeCompactionEntry {
+	return isNativeCompactionEntry(entry) &&
+		(entry.details.strategy === NATIVE_COMPACTION_STRATEGY || entry.details.strategy === NATIVE_COMPACTION_STRATEGY_V2);
+}
+
+/** Preserve the existing one-window plain-summary resend without recompaction. */
+export function canUseAffinityPlainSummary(entries: readonly SessionEntry[], entry: NativeCompactionEntry): boolean {
+	return hasPlainSummary(entry) && entries.filter(isResponsesNativeCompaction).length === 1;
+}
+
+function chainBranch(entries: readonly SessionEntry[]): SessionEntry[] {
+	// getBranch() is root-to-leaf. Removed checkpoints must not leave dangling parents.
+	return entries.map((entry, index) => ({ ...entry, parentId: index > 0 ? entries[index - 1]!.id : null }));
+}
+
 /**
- * Whether a context rebuilt from the branch transcript keeps all history: no
- * compaction still in force holds its history only in a signed item. Pi would
- * rebuild such a compaction from its placeholder summary and drop that history.
+ * Expand Responses checkpoints oldest-first, using Pi's projector, not the opaque
+ * retained items (which cannot recover assistant answers or tool results).
+ * Plain summaries remain usable when an imported branch has no original transcript.
+ * Every opaque checkpoint is checked, even one already retired or hidden by a later
+ * summary: a retirement marker is not proof that its transcript exists.
  */
+function rebuildAffinityBranch(entries: readonly SessionEntry[]): SessionEntry[] | undefined {
+	const rebuilt: SessionEntry[] = [];
+	const seen = new Set<string>();
+	for (const entry of entries) {
+		if (seen.has(entry.id)) return undefined;
+		if (isResponsesNativeCompaction(entry)) {
+			const boundaryPresent = seen.has(entry.firstKeptEntryId);
+			// A single plain checkpoint needs no reconstruction, even when an import
+			// retains only its kept window. Keep its summary for later /compact too.
+			const transcriptPresent = !canUseAffinityPlainSummary(entries, entry) && boundaryPresent && buildSessionContext(chainBranch(rebuilt)).messages.some(
+				(message) => message.role !== "system" &&
+					!(message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")),
+			);
+			if (!transcriptPresent && !hasPlainSummary(entry)) return undefined;
+			if (transcriptPresent) {
+				// Keep the ID as a context-free anchor: a later nonnative summary may
+				// use this checkpoint as firstKeptEntryId. No signed item or placeholder
+				// reaches Pi's projector, and the original chronology remains intact.
+				rebuilt.push({
+					type: "custom", id: entry.id, parentId: entry.parentId, timestamp: entry.timestamp,
+					customType: `${COMPACTION_AFFINITY_RETIRED_ENTRY}.rebuild-anchor`, data: {},
+				});
+			} else {
+				rebuilt.push(entry);
+			}
+		} else {
+			rebuilt.push(entry);
+		}
+		seen.add(entry.id);
+	}
+	return chainBranch(rebuilt);
+}
+
 export function isAffinityRebuildComplete(entries: readonly SessionEntry[]): boolean {
-	return !entries.some(
-		(entry) => isNativeCompactionEntry(entry) && !hasPlainSummary(entry) && !isAffinityRetired(entries, entry.id),
-	);
+	return rebuildAffinityBranch(entries) !== undefined;
 }
 
-/**
- * Pi's context for the branch as if the retired compactions never happened: the
- * history they summarized (assistant answers, tool results, the kept window) comes
- * back from the branch transcript as plain messages.
- */
+/** Pi applies nonnative summaries and context edits to the expanded branch once. */
 export function buildAffinityRetiredSessionMessages(entries: readonly SessionEntry[]): AgentMessage[] {
-	const kept = entries.filter((entry) => !(entry.type === "compaction" && isAffinityRetired(entries, entry.id)));
-	// getBranch() is root-to-leaf, so re-linking in order keeps the path without the retired entries.
-	const chained = kept.map((entry, index) => ({ ...entry, parentId: index > 0 ? kept[index - 1]!.id : null }));
-	return buildSessionContext(chained as SessionEntry[]).messages;
+	const rebuilt = rebuildAffinityBranch(entries);
+	if (!rebuilt) throw new Error("Cannot recover every opaque Responses compaction from the branch transcript");
+	return buildSessionContext(rebuilt).messages;
 }
 
 /**
- * The request to send while the latest compaction is retired. A real plain-text
+ * The request to send while the latest compaction is retired. A single plain-text
  * summary means Pi's own payload is already safe: `{ ok: true }`. Otherwise the
  * history lives only in the rejected signed item, so send the full branch
  * transcript rather than a payload that silently drops it. `{ ok: false }` when
- * neither is safe (an earlier compaction still in force has only a placeholder, or
- * the request has no recognizable prompt preamble): the caller must send nothing.
+ * neither is safe (any opaque window has no recoverable transcript, or the
+ * request has no recognizable prompt preamble): the caller must send nothing.
  */
 export function buildAffinitySafePayload<TApi extends Api>(
 	model: Model<TApi>,
@@ -98,7 +148,7 @@ export function buildAffinitySafePayload<TApi extends Api>(
 	entry: NativeCompactionEntry,
 ): { ok: true; payload?: ResponsesCompatibleRequestPayload } | { ok: false } {
 	if (!isAffinityRebuildComplete(entries)) return { ok: false };
-	if (hasPlainSummary(entry)) return { ok: true };
+	if (canUseAffinityPlainSummary(entries, entry)) return { ok: true };
 	const preamble = extractFreshAuthoritativePreamble(payload);
 	if (!preamble) return { ok: false };
 	return { ok: true, payload: {
