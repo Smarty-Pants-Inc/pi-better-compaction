@@ -2,7 +2,7 @@
 
 English | [中文](README.zh-CN.md)
 
-A [pi](https://github.com/nicepkg/pi) extension that upgrades context compaction with two coordinated strategies:
+A [pi](https://github.com/nicepkg/pi) extension that upgrades context compaction with three coordinated strategies:
 
 1. **OpenAI Responses APIs**, including supported GitHub Copilot models, use the provider's native compaction endpoint, preserving opaque context that plain text summaries lose.
 2. **Anthropic Messages API** uses Anthropic's on-demand server-side compaction (beta `compact-2026-09-04`) and replays the signed compaction block.
@@ -103,12 +103,14 @@ When pi triggers compaction (`session_before_compact`):
    - **V2**: streams a request with `compaction_trigger` to `/responses`; the API returns an encrypted compaction blob. Retained user/developer messages + blob form the compacted context.
    - **V1**: POSTs to `/responses/compact`; receives an opaque compacted window.
    - On success, the compacted window is stored and replayed on subsequent requests via `before_provider_request`.
+   - Replay requires the original provider, API and model. If the latest compaction has only the placeholder summary (always V2, or V1 without extracted text), selecting an incompatible model shows a UI warning: only retained messages remain available, and `/tree` can branch from before the first incompatible compaction (branching just before the latest one may leave earlier opaque checkpoints). Warnings are deduplicated per checkpoint and model within the current session; readable summaries do not trigger them. Configured base URLs are not compared for this warning because OAuth can resolve a different endpoint.
 
 2. **Anthropic Messages API** (`anthropic-messages`) → send Pi's own serialized request for the messages Pi would discard, with `compaction: {type: "summarize"}` and the `compact-2026-09-04` beta:
    - The response holds one signed `compaction` block. It is stored in the compaction entry's `details`, keyed by provider, API, model and base URL. Its text is also the entry summary.
    - Later requests for the same provider and model replace Pi's summary message with the block, verbatim, as the first message. Pi's kept messages stay unchanged.
    - After a switch to another provider or model, Pi's summary is sent instead. A block is never sent to a different provider or model.
-   - If the provider rejects a request that carries the block with an HTTP 400 that names the `compaction` block (for example, `invalid signature in compaction block` after an account failover), the block is retired for the session. The failed reply is omitted from model context, and Pi resends the turn once with its own summary. Rate limits, 5xx errors and other 400s do not retire the block.
+   - If the provider rejects a request that carries the block with an HTTP 400 that names the `compaction` block (for example, `invalid signature in compaction block` after an account failover), or with the 400 that refuses `compaction` next to a gateway-added `context_management`, the block is retired for the session. The failed reply is omitted from model context, and Pi resends the turn once with its own summary. Rate limits, 5xx errors and other 400s do not retire the block.
+   - Some gateways add `context_management` to every thinking request (CLIProxyAPI does with Claude subscriptions), which Anthropic refuses next to `compaction`. On that specific 400 the summary is requested once more without thinking. Thinking blocks already in the history are still sent, and later turns keep the session's thinking level.
    - The compaction threshold stays in Pi's `compaction` settings.
 
 3. **Not a native API, or native compact failed** → if `compactionModel` is configured and differs from the current model, run pi's built-in `compact()` with that model.
