@@ -63,12 +63,12 @@ function contextMessages(branch: Array<Record<string, any>>) {
 }
 
 /** The payload Pi itself builds: its plain summary, the kept messages, then the tail. */
-function piPayload(branch: Array<Record<string, any>>) {
+function piPayload(branch: Array<Record<string, any>>, currentModel = model) {
 	const messages = contextMessages(branch);
 	return {
 		model: model.id,
 		instructions: "system prompt",
-		input: [{ role: "developer", content: "fresh preamble" }, ...serializeMessagesToResponsesInput(model as never, messages as never)],
+		input: [{ role: "developer", content: "fresh preamble" }, ...serializeMessagesToResponsesInput(currentModel as never, messages as never)],
 	};
 }
 
@@ -102,7 +102,7 @@ function turnEnd(errorMessage: string, toolResultEntryIds: string[] = []) {
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
-function harness(recompact = true, compactionVersion: "v1" | "v2" = "v2") {
+function harness(recompact = true, compactionVersion: "v1" | "v2" = "v2", currentModel = model) {
 	const handlers = new Map<string, Handler>();
 	const notes: Array<{ text: string; level: string }> = [];
 	const v1Calls: unknown[] = [];
@@ -136,7 +136,7 @@ function harness(recompact = true, compactionVersion: "v1" | "v2" = "v2") {
 		hasUI: true,
 		abort: () => aborts.push(true),
 		ui: { notify: (text: string, level: string) => notes.push({ text, level }) },
-		model,
+		model: currentModel,
 		getSystemPrompt: () => "system prompt",
 		modelRegistry: { find: () => undefined, getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "sk-test" }) },
 		sessionManager: {
@@ -693,6 +693,64 @@ describe("compaction affinity recovery", () => {
 			}
 		});
 	}
+
+	test("unsupported user/tool-result images, even beside text, fail closed after exact affinity 409; image-capable recovery preserves image data", async () => {
+		const image = { type: "image", data: "YQ==", mimeType: "image/png" };
+		const imageBranch = (role: "user" | "toolResult", mixed: boolean): Array<Record<string, any>> => [
+			{ type: "message", id: "kept", timestamp: "2026-10-06T08:00:00.000Z", message: {
+				role, content: [...(mixed ? [{ type: "text", text: "image caption" }] : []), image], timestamp: 1,
+				...(role === "toolResult" ? { toolCallId: "image_call", toolName: "read", isError: false } : {}),
+			} },
+			compactionEntry("c1", [SIGNED]), userEntry("question", "new question"),
+		];
+		for (const version of ["v1", "v2"] as const) {
+			for (const role of ["user", "toolResult"] as const) {
+				for (const mixed of [false, true]) {
+					const h = harness(true, version);
+					const branch = imageBranch(role, mixed);
+					expect(hasSignedItem(await h.call("before_provider_request", { payload: piPayload(branch) }, branch))).toBe(true);
+					branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
+					const boundary = await h.call("turn_end", turnEnd(AFFINITY_409), branch);
+					expect(boundary).toEqual({ entries: [{ type: "custom", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: "c1" } }] });
+					expect(h.v1Calls).toHaveLength(0);
+					expect(h.v2Calls).toHaveLength(0);
+					expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+					commit(branch, boundary);
+					await h.call("before_agent_start", { prompt: "retry" }, branch);
+					const blocked = await h.call("before_provider_request", { payload: piPayload(branch) }, branch) as { input: unknown[] };
+					expect(blocked.input).toEqual([]);
+					expect(h.aborts).toHaveLength(1);
+					expect(await h.call("session_before_compact", { signal: new AbortController().signal, preparation: { tokensBefore: 1, firstKeptEntryId: "question", messagesToSummarize: [], turnPrefixMessages: [] } }, branch)).toEqual({ cancel: true });
+					expect(h.v1Calls).toHaveLength(0);
+					expect(h.v2Calls).toHaveLength(0);
+					for (const note of h.notes.filter((note) => note.level === "error")) {
+						expect(note.text).not.toContain("/compact");
+						expect(note.text).toContain("/new");
+					}
+				}
+			}
+		}
+		// Counterexample belongs to this base-red regression, not a separate green-on-base test.
+		const imageModel = { ...model, input: ["text", "image"] };
+		for (const role of ["user", "toolResult"] as const) {
+			const h = harness(true, "v2", imageModel);
+			const branch = imageBranch(role, false);
+			expect(hasSignedItem(await h.call("before_provider_request", { payload: piPayload(branch, imageModel) }, branch))).toBe(true);
+			branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
+			const boundary = await h.call("turn_end", turnEnd(AFFINITY_409), branch);
+			expect(h.v2Calls).toHaveLength(1);
+			expect(JSON.stringify(h.v2Calls[0]!.request.input)).toContain('"type":"input_image"');
+			expect(JSON.stringify(h.v2Calls[0]!.request.input)).toContain("data:image/png;base64,YQ==");
+			commit(branch, boundary);
+			expect(await h.call("agent_before_settle", {}, branch)).toEqual({ continue: true });
+			expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+			const resend = JSON.stringify(await h.call("before_provider_request", { payload: piPayload(branch, imageModel) }, branch));
+			expect(resend).toContain(FRESH.encrypted_content);
+			expect(resend).not.toContain(SIGNED.encrypted_content);
+			expect(h.aborts).toHaveLength(0);
+			expect(h.v2Calls).toHaveLength(1);
+		}
+	});
 
 	test("other 409s, other statuses and requests without a compaction item are untouched", async () => {
 		const h = harness();

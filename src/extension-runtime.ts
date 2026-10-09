@@ -230,7 +230,7 @@ async function runResponsesV1Compact(
 		baseUrl: runtime.baseUrl,
 	});
 
-	if (!latestNativeCompaction.ok && latestNativeCompaction.reason === "affinity-retired" && !isAffinityRebuildComplete(branchEntries)) {
+	if (!latestNativeCompaction.ok && latestNativeCompaction.reason === "affinity-retired" && !isAffinityRebuildComplete(branchEntries, runtime.currentModel)) {
 		// An opaque window, even a retired one, has no recoverable transcript.
 		return { outcome: "blocked" };
 	}
@@ -262,7 +262,7 @@ async function runResponsesV1Compact(
 			model: runtime.currentModel,
 			messages:
 				latestNativeCompaction.reason === "affinity-retired"
-					? buildAffinityRetiredSessionMessages(branchEntries)
+					? buildAffinityRetiredSessionMessages(branchEntries, runtime.currentModel)
 					: buildSessionMessages(ctx),
 			instructions,
 		});
@@ -393,7 +393,7 @@ async function runResponsesV2Compact(
 		baseUrl: runtime.baseUrl,
 	});
 
-	if (!latestNativeCompaction.ok && latestNativeCompaction.reason === "affinity-retired" && !isAffinityRebuildComplete(branchEntries)) {
+	if (!latestNativeCompaction.ok && latestNativeCompaction.reason === "affinity-retired" && !isAffinityRebuildComplete(branchEntries, runtime.currentModel)) {
 		// An opaque window, even a retired one, has no recoverable transcript.
 		return { outcome: "blocked" };
 	}
@@ -425,7 +425,7 @@ async function runResponsesV2Compact(
 			model: runtime.currentModel,
 			messages:
 				latestNativeCompaction.reason === "affinity-retired"
-					? buildAffinityRetiredSessionMessages(branchEntries)
+					? buildAffinityRetiredSessionMessages(branchEntries, runtime.currentModel)
 					: buildSessionMessages(ctx),
 			instructions,
 		});
@@ -951,7 +951,7 @@ async function handleBeforeProviderRequest(
 		);
 		if (!safe.ok) {
 			ctx.abort();
-			logAffinityRecovery(ctx, config, isAffinityRebuildComplete(branchEntries) ? AFFINITY_BLOCKED_NO_PREAMBLE : AFFINITY_BLOCKED, "error");
+			logAffinityRecovery(ctx, config, isAffinityRebuildComplete(branchEntries, runtime.currentModel) ? AFFINITY_BLOCKED_NO_PREAMBLE : AFFINITY_BLOCKED, "error");
 		}
 		return safePayload;
 	}
@@ -1107,7 +1107,7 @@ async function recoverCompactionAffinity(
 		{ ...retire, id: `${EXTENSION_ID}.pending-retire`, parentId: null, timestamp },
 		{ ...dropFailed, id: `${EXTENSION_ID}.pending-edit`, parentId: null, timestamp },
 	] as SessionEntry[];
-	if (!isNativeCompactionEntry(entry) || !isAffinityRebuildComplete(pending)) {
+	if (!isNativeCompactionEntry(entry) || !isAffinityRebuildComplete(pending, ctx.model)) {
 		// Validate all windows, including retired ones, before making any request.
 		logAffinityRecovery(ctx, config, AFFINITY_BLOCKED, "error");
 		return { entries: [retire] };

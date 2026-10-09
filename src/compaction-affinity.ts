@@ -83,14 +83,20 @@ function chainBranch(entries: readonly SessionEntry[]): SessionEntry[] {
 }
 
 /** Role presence alone does not prove that the Responses serializer can recover history. */
-function hasRecoverableTranscript(messages: AgentMessage[]): boolean {
+function hasRecoverableTranscript(messages: AgentMessage[], model?: Pick<Model<Api>, "input">): boolean {
 	// Convert Pi's custom messages and summaries exactly as the serializer does,
 	// but do not let the wrapper around an empty summary stand in for history.
 	const meaningfulSummaries = messages.filter((message) =>
 		(message.role !== "compactionSummary" && message.role !== "branchSummary") ||
 			(typeof message.summary === "string" && !!message.summary.trim()),
 	);
-	return convertToLlm(meaningfulSummaries).some((message) => {
+	const llmMessages = convertToLlm(meaningfulSummaries);
+	// Reject partial recovery too: text beside an unsupported image cannot preserve history.
+	if (model && !model.input.includes("image") && llmMessages.some((message) =>
+		(message.role === "user" || message.role === "toolResult") && Array.isArray(message.content) &&
+			message.content.some((block) => block.type === "image"),
+	)) return false;
+	return llmMessages.some((message) => {
 		if (message.role !== "user" && message.role !== "assistant" && message.role !== "toolResult") return false;
 		if (message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) return false;
 		if (typeof message.content === "string") return !!message.content.trim();
@@ -114,7 +120,7 @@ function hasRecoverableTranscript(messages: AgentMessage[]): boolean {
  * Every opaque checkpoint is checked, even one already retired or hidden by a later
  * summary: a retirement marker is not proof that its transcript exists.
  */
-function rebuildAffinityBranch(entries: readonly SessionEntry[]): SessionEntry[] | undefined {
+function rebuildAffinityBranch(entries: readonly SessionEntry[], model?: Pick<Model<Api>, "input">): SessionEntry[] | undefined {
 	const rebuilt: SessionEntry[] = [];
 	const seen = new Set<string>();
 	for (const entry of entries) {
@@ -124,7 +130,7 @@ function rebuildAffinityBranch(entries: readonly SessionEntry[]): SessionEntry[]
 			// A single plain checkpoint needs no reconstruction, even when an import
 			// retains only its kept window. Keep its summary for later /compact too.
 			const transcriptPresent = !canUseAffinityPlainSummary(entries, entry) && boundaryPresent &&
-				hasRecoverableTranscript(buildSessionContext(chainBranch(rebuilt)).messages);
+				hasRecoverableTranscript(buildSessionContext(chainBranch(rebuilt)).messages, model);
 			if (!transcriptPresent && !hasPlainSummary(entry)) return undefined;
 			if (transcriptPresent) {
 				// Keep the ID as a context-free anchor: a later nonnative summary may
@@ -145,13 +151,13 @@ function rebuildAffinityBranch(entries: readonly SessionEntry[]): SessionEntry[]
 	return chainBranch(rebuilt);
 }
 
-export function isAffinityRebuildComplete(entries: readonly SessionEntry[]): boolean {
-	return rebuildAffinityBranch(entries) !== undefined;
+export function isAffinityRebuildComplete(entries: readonly SessionEntry[], model?: Pick<Model<Api>, "input">): boolean {
+	return rebuildAffinityBranch(entries, model) !== undefined;
 }
 
 /** Pi applies nonnative summaries and context edits to the expanded branch once. */
-export function buildAffinityRetiredSessionMessages(entries: readonly SessionEntry[]): AgentMessage[] {
-	const rebuilt = rebuildAffinityBranch(entries);
+export function buildAffinityRetiredSessionMessages(entries: readonly SessionEntry[], model?: Pick<Model<Api>, "input">): AgentMessage[] {
+	const rebuilt = rebuildAffinityBranch(entries, model);
 	if (!rebuilt) throw new Error("Cannot recover every opaque Responses compaction from the branch transcript");
 	return buildSessionContext(rebuilt).messages;
 }
@@ -170,7 +176,7 @@ export function buildAffinitySafePayload<TApi extends Api>(
 	entries: readonly SessionEntry[],
 	entry: NativeCompactionEntry,
 ): { ok: true; payload?: ResponsesCompatibleRequestPayload } | { ok: false } {
-	if (!isAffinityRebuildComplete(entries)) return { ok: false };
+	if (!isAffinityRebuildComplete(entries, model)) return { ok: false };
 	if (canUseAffinityPlainSummary(entries, entry)) return { ok: true };
 	const preamble = extractFreshAuthoritativePreamble(payload);
 	if (!preamble) return { ok: false };
@@ -179,7 +185,7 @@ export function buildAffinitySafePayload<TApi extends Api>(
 		...(preamble.instructions !== undefined ? { instructions: preamble.instructions } : {}),
 		input: [
 			...preamble.leadingInput,
-			...serializeMessagesToResponsesInput(model, buildAffinityRetiredSessionMessages(entries)),
+			...serializeMessagesToResponsesInput(model, buildAffinityRetiredSessionMessages(entries, model)),
 			...preamble.trailingInput,
 		],
 	} };
