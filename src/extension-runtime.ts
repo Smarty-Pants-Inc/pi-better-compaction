@@ -27,7 +27,7 @@ import {
 	buildAffinityRetiredSessionMessages,
 	buildAffinitySafePayload,
 	COMPACTION_AFFINITY_RETIRED_ENTRY,
-	hasPlainSummary,
+	canUseAffinityPlainSummary,
 	isAffinityRebuildComplete,
 	isAffinityRetired,
 	isCompactionAffinityMissing,
@@ -230,8 +230,8 @@ async function runResponsesV1Compact(
 		baseUrl: runtime.baseUrl,
 	});
 
-	if (!latestNativeCompaction.ok && latestNativeCompaction.reason === "affinity-retired" && !isAffinityRebuildComplete(branchEntries)) {
-		// An earlier compaction is still in force with only a placeholder summary: compacting now would lose its history for good.
+	if (!latestNativeCompaction.ok && latestNativeCompaction.reason === "affinity-retired" && !isAffinityRebuildComplete(branchEntries, runtime.currentModel)) {
+		// An opaque window, even a retired one, has no recoverable transcript.
 		return { outcome: "blocked" };
 	}
 
@@ -262,7 +262,7 @@ async function runResponsesV1Compact(
 			model: runtime.currentModel,
 			messages:
 				latestNativeCompaction.reason === "affinity-retired"
-					? buildAffinityRetiredSessionMessages(branchEntries)
+					? buildAffinityRetiredSessionMessages(branchEntries, runtime.currentModel)
 					: buildSessionMessages(ctx),
 			instructions,
 		});
@@ -393,8 +393,8 @@ async function runResponsesV2Compact(
 		baseUrl: runtime.baseUrl,
 	});
 
-	if (!latestNativeCompaction.ok && latestNativeCompaction.reason === "affinity-retired" && !isAffinityRebuildComplete(branchEntries)) {
-		// An earlier compaction is still in force with only a placeholder summary: compacting now would lose its history for good.
+	if (!latestNativeCompaction.ok && latestNativeCompaction.reason === "affinity-retired" && !isAffinityRebuildComplete(branchEntries, runtime.currentModel)) {
+		// An opaque window, even a retired one, has no recoverable transcript.
 		return { outcome: "blocked" };
 	}
 
@@ -425,7 +425,7 @@ async function runResponsesV2Compact(
 			model: runtime.currentModel,
 			messages:
 				latestNativeCompaction.reason === "affinity-retired"
-					? buildAffinityRetiredSessionMessages(branchEntries)
+					? buildAffinityRetiredSessionMessages(branchEntries, runtime.currentModel)
 					: buildSessionMessages(ctx),
 			instructions,
 		});
@@ -951,7 +951,7 @@ async function handleBeforeProviderRequest(
 		);
 		if (!safe.ok) {
 			ctx.abort();
-			logAffinityRecovery(ctx, config, isAffinityRebuildComplete(branchEntries) ? AFFINITY_BLOCKED_NO_PREAMBLE : AFFINITY_BLOCKED, "error");
+			logAffinityRecovery(ctx, config, isAffinityRebuildComplete(branchEntries, runtime.currentModel) ? AFFINITY_BLOCKED_NO_PREAMBLE : AFFINITY_BLOCKED, "error");
 		}
 		return safePayload;
 	}
@@ -1013,11 +1013,11 @@ async function handleBeforeProviderRequest(
 	return rewrite.rewrittenPayload;
 }
 
-// An earlier placeholder compaction is still in force: /compact would make its loss permanent.
+// An opaque window has no recoverable transcript: /compact would make its loss permanent.
 const AFFINITY_KEEP_HISTORY =
 	"to keep all history, start a new session with /new, or use /tree to return to a point before the earlier compaction";
 const AFFINITY_BLOCKED = `blocked (the context rebuilt without the retired compaction would drop compacted history; nothing was sent; ${AFFINITY_KEEP_HISTORY})`;
-const AFFINITY_COMPACT_BLOCKED = `compaction cancelled (an earlier compaction holds history only in a signed item the gateway rejected; compacting now would lose it for good; ${AFFINITY_KEEP_HISTORY})`;
+const AFFINITY_COMPACT_BLOCKED = `compaction cancelled (an opaque compaction has no recoverable branch transcript; compacting now would lose its history for good; ${AFFINITY_KEEP_HISTORY})`;
 const AFFINITY_BLOCKED_NO_PREAMBLE =
 	"blocked (the context rebuilt without the retired compaction would drop compacted history; nothing was sent; run /compact or retry)";
 
@@ -1034,8 +1034,8 @@ function logAffinityRecovery(
 }
 
 /**
- * Recompact on the current account from the branch transcript, with the rejected
- * compaction already retired, through the extension's own Responses compaction path.
+ * Recompact once on the current account after expanding every native Responses
+ * window from the branch transcript, through the extension's own compaction path.
  */
 async function recompactAfterAffinityMiss(
 	ctx: ExtensionContext,
@@ -1063,9 +1063,9 @@ async function recompactAfterAffinityMiss(
 
 /**
  * The gateway answered 409 compaction_affinity_missing to a request that replayed a
- * signed compaction item: retire that compaction for good. A plain-text summary
- * already carries the history, so Pi's own payload is resent. Otherwise the history
- * lives only in the rejected item: recompact the branch transcript on the current
+ * signed compaction item: retire that compaction for good. A single plain-text
+ * summary already carries the history, so Pi's own payload is resent. Otherwise
+ * expand every native Responses window and recompact the transcript on the current
  * account and resend once with that compaction; if that fails, resend nothing. The
  * error turn ran no tools, so a resend re-executes none. One recovery per user
  * prompt, so this cannot loop.
@@ -1107,13 +1107,12 @@ async function recoverCompactionAffinity(
 		{ ...retire, id: `${EXTENSION_ID}.pending-retire`, parentId: null, timestamp },
 		{ ...dropFailed, id: `${EXTENSION_ID}.pending-edit`, parentId: null, timestamp },
 	] as SessionEntry[];
-	if (!isAffinityRebuildComplete(pending)) {
-		// An earlier compaction still in force has only a placeholder summary, so neither a
-		// resend nor a recompaction would carry its history: retire, resend nothing.
+	if (!isNativeCompactionEntry(entry) || !isAffinityRebuildComplete(pending, ctx.model)) {
+		// Validate all windows, including retired ones, before making any request.
 		logAffinityRecovery(ctx, config, AFFINITY_BLOCKED, "error");
 		return { entries: [retire] };
 	}
-	if (isNativeCompactionEntry(entry) && hasPlainSummary(entry)) {
+	if (canUseAffinityPlainSummary(pending, entry)) {
 		state.resendAfterAffinityRecovery = true;
 		logAffinityRecovery(ctx, config, "retrying (compaction retired; resending once with its plain-text summary)");
 		return { entries: [retire, dropFailed] };
@@ -1125,7 +1124,7 @@ async function recoverCompactionAffinity(
 		dependencies,
 		pending,
 		failedEntryId,
-		isNativeCompactionEntry(entry) ? entry.tokensBefore : 0,
+		entry.tokensBefore,
 	);
 	if (!compaction) {
 		logAffinityRecovery(
