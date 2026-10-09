@@ -546,6 +546,38 @@ describe("runtime", () => {
 		expect(await h.call("agent_before_settle", {}, h.context(opus, branch))).toBeUndefined();
 	});
 
+	test("the gateway's compaction/context_management 400 on an ordinary turn also retires the block and resends once", async () => {
+		const conflict =
+			'400 {"type":"error","error":{"type":"invalid_request_error","message":"compaction and context_management cannot be used in the same request"}}';
+		const h = harness();
+		const branch: unknown[] = [userEntry("kept", "kept"), anthropicCompactionEntry("c1", "kept"), userEntry("u2", "next")];
+		expect(await h.call("before_provider_request", { payload: piPayload() }, h.context(opus, branch))).toBeDefined();
+
+		branch.push({ type: "message", id: "a1", message: rejectedTurn(conflict) });
+		const boundary = (await h.call("turn_end", turnEnd(conflict), h.context(opus, branch))) as {
+			entries: Array<Record<string, unknown>>;
+		};
+		expect(boundary).toEqual({
+			entries: [
+				{ type: "custom", customType: ANTHROPIC_BLOCK_REJECTED_ENTRY, data: { compactionEntryId: "c1" } },
+				{ type: "context_edit", targetId: "a1", replacement: null },
+			],
+		});
+		branch.push(...boundary.entries.map((entry, index) => ({ ...entry, id: `b${index}` })));
+		expect(await h.call("agent_before_settle", {}, h.context(opus, branch))).toEqual({ continue: true });
+
+		expect(await h.call("before_provider_request", { payload: piPayload() }, h.context(opus, branch))).toBeUndefined();
+		expect(await h.call("turn_end", turnEnd(conflict), h.context(opus, branch))).toBeUndefined();
+		expect(await h.call("agent_before_settle", {}, h.context(opus, branch))).toBeUndefined();
+
+		// The same text under another status is not the conflict.
+		const other = harness();
+		const otherBranch = [userEntry("kept", "kept"), anthropicCompactionEntry("c1", "kept"), userEntry("u2", "next")];
+		await other.call("before_provider_request", { payload: piPayload() }, other.context(opus, otherBranch));
+		expect(await other.call("turn_end", turnEnd(conflict.replace(/^400/, "500")), other.context(opus, otherBranch))).toBeUndefined();
+		expect(other.appended).toHaveLength(0);
+	});
+
 	test("on Pi without turn_end boundary results, the block is retired for the next prompt", async () => {
 		const h = harness();
 		const branch = [userEntry("kept", "kept"), anthropicCompactionEntry("c1", "kept"), userEntry("u2", "next")];

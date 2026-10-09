@@ -13,6 +13,7 @@ import {
 	executeAnthropicCompaction,
 	getAnthropicTools,
 	isAnthropicMessagesPayload,
+	isContextManagementConflict,
 	rememberAnthropicTools,
 	replaceSummaryWithBlock,
 	resolveAnthropicReplay,
@@ -79,16 +80,17 @@ type RuntimeState = {
 /**
  * The error text Pi records when Anthropic rejects a replayed block, for example
  * 400 {"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content.0: invalid `signature` in `compaction` block"}}.
- * Only a 400 that names the compaction block matches.
+ * Only a 400 that names the compaction block matches, or the 400 Anthropic
+ * returns when a gateway (CLIProxyAPI with thinking on) adds `context_management`
+ * to an ordinary request that replays the block.
  */
 const ANTHROPIC_BLOCK_REJECTION = /^400\b[\s\S]*\bcompaction`?\s+block\b/;
 
 function isAnthropicBlockRejection(message: AgentMessage): boolean {
-	return (
-		message.role === "assistant" &&
-		message.stopReason === "error" &&
-		ANTHROPIC_BLOCK_REJECTION.test(message.errorMessage ?? "")
-	);
+	if (message.role !== "assistant" || message.stopReason !== "error") return false;
+	const errorMessage = message.errorMessage ?? "";
+	const status = Number(/^(\d{3})\b/.exec(errorMessage)?.[1]);
+	return ANTHROPIC_BLOCK_REJECTION.test(errorMessage) || isContextManagementConflict(status, errorMessage);
 }
 
 /**

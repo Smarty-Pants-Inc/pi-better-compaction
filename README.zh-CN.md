@@ -109,7 +109,7 @@ pi 触发压缩时（`session_before_compact`）：
    - 响应中的带签名 `compaction` 块存入压缩条目的 `details`，按提供商、API、模型和基础 URL 匹配。块中的文本同时作为 Pi 的摘要。
    - 后续使用同一提供商和模型时，用原始压缩块替换 Pi 的摘要消息；Pi 保留的消息不变。
    - 切换提供商或模型后改用文本摘要，不向其他提供商或模型发送压缩块。
-   - 如果提供商对携带压缩块的请求返回 HTTP 400，该块会在当前会话中停用，后续使用文本摘要。
+   - 如果提供商对携带压缩块的请求返回指明 `compaction` 块的 HTTP 400（例如账号故障转移后的 `invalid signature in compaction block`），或返回 `compaction` 与 `context_management` 冲突的 HTTP 400，该块会在当前会话中停用。失败的回复不再计入模型上下文，Pi 会使用自己的摘要重发一次该轮对话。限流、5xx 错误和其他 400 不会停用该块。
    - 某些网关（如使用 Claude 订阅的 CLIProxyAPI）会向启用 thinking 的请求注入 `context_management`，而 Anthropic 不允许它与 `compaction` 同时出现。仅遇到这一特定的 HTTP 400 时，扩展会移除请求的 thinking 参数重试一次。历史中的 thinking 块保留，后续对话的思考级别不变。
    - 压缩阈值仍由 Pi 的 `compaction` 设置控制。
 
