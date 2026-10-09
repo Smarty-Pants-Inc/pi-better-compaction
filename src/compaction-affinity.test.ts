@@ -602,6 +602,98 @@ describe("compaction affinity recovery", () => {
 		expect(errors[0]!.text).toContain("retry");
 	});
 
+	for (const [label, retainedContent] of [
+		["content-empty", []],
+		["empty-string", [{ type: "text", text: "" }]],
+		["whitespace", [{ type: "text", text: "   " }]],
+	] as const) {
+		test(`v2: ${label} retained user before an opaque checkpoint fails closed after the exact affinity 409`, async () => {
+			const h = harness();
+			const branch: Array<Record<string, any>> = [
+				{
+					type: "message",
+					id: "kept",
+					timestamp: "2026-10-06T08:00:00.000Z",
+					message: { role: "user", content: retainedContent, timestamp: 1 },
+				},
+				// The signed item is opaque; the only apparent prefix is the empty retained user above.
+				compactionEntry("c1", [SIGNED]),
+				userEntry("question", "new question"),
+			];
+			expect(hasSignedItem(await h.call("before_provider_request", { payload: piPayload(branch) }, branch))).toBe(true);
+			branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
+
+			const boundary = (await h.call("turn_end", turnEnd(AFFINITY_409), branch)) as { entries: Array<Record<string, any>> };
+			// No history-losing recovery: no recompact, failed-reply edit, fresh checkpoint, or continuation.
+			expect(h.v1Calls).toHaveLength(0);
+			expect(h.v2Calls).toHaveLength(0);
+			expect(boundary).toEqual({
+				entries: [{ type: "custom", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: "c1" } }],
+			});
+			expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+
+			// The next prompt is fail-closed: abort before sending Pi's empty/truncated payload.
+			commit(branch, boundary);
+			await h.call("before_agent_start", { prompt: "retry" }, branch);
+			branch.push(userEntry("retry", "retry"));
+			const blocked = (await h.call("before_provider_request", { payload: piPayload(branch) }, branch)) as { input: unknown[] };
+			expect(blocked.input).toEqual([]);
+			expect(h.aborts).toHaveLength(1);
+			expect(JSON.stringify(blocked)).not.toContain(SIGNED.encrypted_content);
+			expect(JSON.stringify(blocked)).not.toContain(NATIVE_COMPACTION_FALLBACK_SUMMARY);
+
+			const compact = await h.call(
+				"session_before_compact",
+				{
+					signal: new AbortController().signal,
+					preparation: { tokensBefore: 1, firstKeptEntryId: "retry", messagesToSummarize: [], turnPrefixMessages: [] },
+				},
+				branch,
+			);
+			expect(compact).toEqual({ cancel: true });
+			expect(h.v1Calls).toHaveLength(0);
+			expect(h.v2Calls).toHaveLength(0);
+			expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+
+			if (label === "content-empty") {
+				// Counterexample in the same regression: an empty retained user is safe when
+				// the recovered prefix also contains genuine non-text tool history.
+				const valid = harness();
+				const call = { type: "toolCall", id: "call_nontext|fc_nontext", name: "read", arguments: { path: "a.ts" } };
+				const validBranch: Array<Record<string, any>> = [
+					{
+						type: "message",
+						id: "valid-kept",
+						timestamp: "2026-10-06T08:00:00.000Z",
+						message: { role: "user", content: [], timestamp: 1 },
+					},
+					{ type: "message", id: "valid-call", message: { role: "assistant", provider: model.provider, api: model.api, model: model.id, stopReason: "toolUse", content: [call], timestamp: 2 } },
+					{ type: "message", id: "valid-result", message: { role: "toolResult", toolCallId: call.id, toolName: "read", isError: false, content: [{ type: "text", text: "file body" }], timestamp: 3 } },
+					{ ...compactionEntry("valid-c1", [SIGNED]), firstKeptEntryId: "valid-kept" },
+					userEntry("valid-question", "new question"),
+				];
+				expect(hasSignedItem(await valid.call("before_provider_request", { payload: piPayload(validBranch) }, validBranch))).toBe(true);
+				validBranch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
+				const validBoundary = (await valid.call("turn_end", turnEnd(AFFINITY_409), validBranch)) as { entries: Array<Record<string, any>> };
+				expect(valid.v2Calls).toHaveLength(1);
+				expect((valid.v2Calls[0]!.request.input as Array<Record<string, any>>).filter((item) => item.type === "function_call")).toEqual([
+					{ type: "function_call", id: "fc_nontext", call_id: "call_nontext", name: "read", arguments: JSON.stringify(call.arguments) },
+				]);
+				expect((valid.v2Calls[0]!.request.input as Array<Record<string, any>>).filter((item) => item.type === "function_call_output")).toEqual([
+					{ type: "function_call_output", call_id: "call_nontext", output: "file body" },
+				]);
+				expect(validBoundary.entries.filter((entry) => entry.type === "context_edit")).toEqual([{ type: "context_edit", targetId: "failed", replacement: null }]);
+				expect(validBoundary.entries.filter((entry) => entry.type === "compaction")).toHaveLength(1);
+				commit(validBranch, validBoundary);
+				expect(await valid.call("agent_before_settle", {}, validBranch)).toEqual({ continue: true });
+				const resend = JSON.stringify(await valid.call("before_provider_request", { payload: piPayload(validBranch) }, validBranch));
+				expect(resend).toContain(FRESH.encrypted_content);
+				expect(resend).not.toContain(SIGNED.encrypted_content);
+				expect(valid.aborts).toHaveLength(0);
+			}
+		});
+	}
+
 	test("other 409s, other statuses and requests without a compaction item are untouched", async () => {
 		const h = harness();
 		const branch: Array<Record<string, any>> = [userEntry("kept", "kept"), compactionEntry("c1", [RETAINED, SIGNED]), userEntry("u2", "next")];

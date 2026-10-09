@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { buildSessionContext, type CompactionEntry, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, convertToLlm, type CompactionEntry, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
 	resolveLatestNativeCompactionEntry,
 	type LatestNativeCompactionResolution,
@@ -82,6 +82,31 @@ function chainBranch(entries: readonly SessionEntry[]): SessionEntry[] {
 	return entries.map((entry, index) => ({ ...entry, parentId: index > 0 ? entries[index - 1]!.id : null }));
 }
 
+/** Role presence alone does not prove that the Responses serializer can recover history. */
+function hasRecoverableTranscript(messages: AgentMessage[]): boolean {
+	// Convert Pi's custom messages and summaries exactly as the serializer does,
+	// but do not let the wrapper around an empty summary stand in for history.
+	const meaningfulSummaries = messages.filter((message) =>
+		(message.role !== "compactionSummary" && message.role !== "branchSummary") ||
+			(typeof message.summary === "string" && !!message.summary.trim()),
+	);
+	return convertToLlm(meaningfulSummaries).some((message) => {
+		if (message.role !== "user" && message.role !== "assistant" && message.role !== "toolResult") return false;
+		if (message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) return false;
+		if (typeof message.content === "string") return !!message.content.trim();
+		return Array.isArray(message.content) && message.content.some((block) => {
+			if (!isRecord(block)) return false;
+			if (block.type === "text") return typeof block.text === "string" && !!block.text.trim();
+			if (block.type === "image") return message.role !== "assistant" &&
+				typeof block.data === "string" && !!block.data.trim() && typeof block.mimeType === "string" && !!block.mimeType.trim();
+			// Unsigned/unsupported thinking is discarded by Responses serialization.
+			return message.role === "assistant" && block.type === "toolCall" &&
+				typeof block.id === "string" && !!block.id.trim() && typeof block.name === "string" && !!block.name.trim() &&
+				isRecord(block.arguments);
+		});
+	});
+}
+
 /**
  * Expand Responses checkpoints oldest-first, using Pi's projector, not the opaque
  * retained items (which cannot recover assistant answers or tool results).
@@ -98,10 +123,8 @@ function rebuildAffinityBranch(entries: readonly SessionEntry[]): SessionEntry[]
 			const boundaryPresent = seen.has(entry.firstKeptEntryId);
 			// A single plain checkpoint needs no reconstruction, even when an import
 			// retains only its kept window. Keep its summary for later /compact too.
-			const transcriptPresent = !canUseAffinityPlainSummary(entries, entry) && boundaryPresent && buildSessionContext(chainBranch(rebuilt)).messages.some(
-				(message) => message.role !== "system" &&
-					!(message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")),
-			);
+			const transcriptPresent = !canUseAffinityPlainSummary(entries, entry) && boundaryPresent &&
+				hasRecoverableTranscript(buildSessionContext(chainBranch(rebuilt)).messages);
 			if (!transcriptPresent && !hasPlainSummary(entry)) return undefined;
 			if (transcriptPresent) {
 				// Keep the ID as a context-free anchor: a later nonnative summary may
