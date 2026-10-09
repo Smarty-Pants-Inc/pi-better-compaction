@@ -36,6 +36,7 @@
     "src/anthropic-compaction.ts",
     "src/compact-client.ts",
     "src/compact-client-v2.ts",
+    "src/compaction-affinity.ts",
     "src/config.ts",
     "src/debug.ts",
     "src/details-store.ts",
