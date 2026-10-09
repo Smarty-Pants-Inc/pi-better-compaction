@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildSessionContext } from "@earendil-works/pi-coding-agent";
-import { buildAffinityRetiredSessionMessages, buildAffinitySafePayload, COMPACTION_AFFINITY_RETIRED_ENTRY, isAffinityRebuildComplete, isCompactionAffinityMissing } from "./compaction-affinity";
+import { buildAffinityRetiredSessionMessages, buildAffinitySafePayload, canUseAffinityPlainSummary, COMPACTION_AFFINITY_RETIRED_ENTRY, isAffinityRebuildComplete, isCompactionAffinityMissing } from "./compaction-affinity";
 import { registerExtensionRuntime } from "./extension-runtime";
 import { serializeMessagesToResponsesInput } from "./serializer";
 import { DEFAULT_EXTENSION_CONFIG, NATIVE_COMPACTION_FALLBACK_SUMMARY, NATIVE_COMPACTION_STRATEGY, NATIVE_COMPACTION_STRATEGY_V2, createNativeCompactionDetails } from "./types";
@@ -334,10 +334,10 @@ describe("compaction affinity recovery", () => {
 	});
 
 	/** Assert all three fail-closed paths, not just the coverage predicate. */
-	async function expectGapBlocked(branch: Array<Record<string, any>>, version: "v1" | "v2") {
+	async function expectGapBlocked(branch: Array<Record<string, any>>, version: "v1" | "v2", replayBranch = branch) {
 		const h = harness(true, version);
 		const latestId = branch.filter((entry) => entry.type === "compaction").at(-1)!.id;
-		expect(hasSignedItem(await h.call("before_provider_request", { payload: piPayload(branch) }, branch))).toBe(true);
+		expect(hasSignedItem(await h.call("before_provider_request", { payload: piPayload(replayBranch) }, replayBranch))).toBe(true);
 		branch.push({ type: "message", id: "failed", message: errorTurn(AFFINITY_409) });
 		const beforeRecovery = JSON.stringify(linkBranch(branch));
 		const boundary = await h.call("turn_end", turnEnd(AFFINITY_409), branch);
@@ -370,6 +370,127 @@ describe("compaction affinity recovery", () => {
 			expect(error.text).not.toContain("/compact");
 		}
 	}
+
+	/** A single readable summary may replace transcript evidence, never branch structure. */
+	function summarizedSingleWindowBranch(
+		gap: "missing-boundary" | "broken-chain",
+		strategy: typeof NATIVE_COMPACTION_STRATEGY | typeof NATIVE_COMPACTION_STRATEGY_V2,
+	): Array<Record<string, any>> {
+		const branch = linkBranch(v2Branch());
+		const entry = branch.find((candidate) => candidate.id === "c1")!;
+		entry.summary = "Nonblank single-window summary cannot repair missing history.";
+		entry.details.strategy = strategy;
+		if (gap === "missing-boundary") entry.firstKeptEntryId = "missing-original";
+		else branch.find((candidate) => candidate.id === "a0")!.parentId = "missing-original-parent";
+		return branch;
+	}
+
+	for (const gap of ["missing-boundary", "broken-chain"] as const) {
+		for (const version of ["v1", "v2"] as const) {
+			test(`SEC P1 round 4 ${version}: single nonblank summary with ${gap} blocks 409 recovery, resend and recompaction`, async () => {
+				for (const strategy of [NATIVE_COMPACTION_STRATEGY, NATIVE_COMPACTION_STRATEGY_V2]) {
+					const branch = summarizedSingleWindowBranch(gap, strategy);
+					// Record the in-flight replay before the boundary/chain is lost.
+					// Recovery must validate the current branch, not the earlier request.
+					const replayBranch = branch.map((entry) => ({ ...entry }));
+					replayBranch.find((entry) => entry.id === "c1")!.firstKeptEntryId = "kept";
+					replayBranch.find((entry) => entry.id === "a0")!.parentId = "u0";
+					await expectGapBlocked(branch, version, replayBranch);
+				}
+			});
+
+			for (const path of ["before_provider_request", "session_before_compact"] as const) {
+				test(`SEC P1 round 4 ${version}: persisted single-summary retirement with ${gap} blocks ${path} independently`, async () => {
+					for (const strategy of [NATIVE_COMPACTION_STRATEGY, NATIVE_COMPACTION_STRATEGY_V2]) {
+						const h = harness(true, version);
+						const branch = summarizedSingleWindowBranch(gap, strategy);
+						branch.push({ type: "custom", id: "retired", customType: COMPACTION_AFFINITY_RETIRED_ENTRY, data: { compactionEntryId: "c1" } });
+						const before = JSON.stringify(linkBranch(branch));
+						if (path === "before_provider_request") {
+							const blocked = await h.call(path, { payload: piPayload(branch) }, branch) as { input: unknown[] } | undefined;
+							expect(blocked).toBeDefined();
+							expect(blocked!.input).toEqual([]);
+							expect(h.aborts).toHaveLength(1);
+						} else {
+							expect(await h.call(path, {
+								signal: new AbortController().signal,
+								preparation: { tokensBefore: 1, firstKeptEntryId: "u2", messagesToSummarize: [], turnPrefixMessages: [] },
+							}, branch)).toEqual({ cancel: true });
+						}
+						expect(JSON.stringify(branch)).toBe(before);
+						expect(h.v1Calls).toHaveLength(0);
+						expect(h.v2Calls).toHaveLength(0);
+						expect(await h.call("agent_before_settle", {}, branch)).toBeUndefined();
+						const errors = h.notes.filter((note) => note.level === "error");
+						expect(errors).toHaveLength(1);
+						expect(errors[0]!.text).toContain("/new");
+						expect(errors[0]!.text).toContain("/tree");
+						expect(errors[0]!.text).not.toContain("/compact");
+					}
+				});
+			}
+		}
+	}
+
+	test("SEC P1 round 4: single-summary helpers reject missing boundaries and every original parent gap without repair", () => {
+		for (const strategy of [NATIVE_COMPACTION_STRATEGY, NATIVE_COMPACTION_STRATEGY_V2]) {
+			for (const damage of [
+				["c1", "firstKeptEntryId", "missing-boundary"],
+				["c1", "firstKeptEntryId", "u2"],
+				["u0", "parentId", "missing-root"],
+				["u0", "parentId", undefined],
+				["a0", "parentId", "missing-original-parent"],
+				["a0", "parentId", undefined],
+				["a0", "parentId", "a0"],
+				["kept", "parentId", "u0"],
+				["c1", "parentId", "missing-checkpoint-parent"],
+			] as const) {
+				const branch = linkBranch(v2Branch());
+				const entry = branch.find((candidate) => candidate.id === "c1")!;
+				entry.summary = "Cat is Biscuit.";
+				entry.details.strategy = strategy;
+				branch.find((candidate) => candidate.id === damage[0])![damage[1]] = damage[2];
+				const before = JSON.stringify(branch);
+				expect(canUseAffinityPlainSummary(branch as never, entry as never)).toBe(false);
+				expect(isAffinityRebuildComplete(branch as never, model as never)).toBe(false);
+				expect(buildAffinitySafePayload(model as never, piPayload(branch), branch as never, entry as never)).toEqual({ ok: false });
+				expect(() => buildAffinityRetiredSessionMessages(branch as never, model as never)).toThrow("Cannot recover every opaque Responses compaction");
+				expect(JSON.stringify(branch)).toBe(before);
+			}
+
+			// A preceding nonnative summary must not narrow the chain check and
+			// bless a broken session root after the single-summary shortcut is denied.
+			const coveredButBroken = linkBranch([
+				{ ...userEntry("root", "Original question"), parentId: "missing-root" },
+				assistantEntry("answer", "Original answer"),
+				{ ...compactionEntry("plain", [], "Earlier nonnative summary."), firstKeptEntryId: "answer", details: undefined },
+				userEntry("kept", "Kept question"),
+				compactionEntry("single", [SIGNED], "Cat is Biscuit."), userEntry("tail", "Next question"),
+			]);
+			const single = coveredButBroken.find((entry) => entry.id === "single")!;
+			single.details.strategy = strategy;
+			const before = JSON.stringify(coveredButBroken);
+			expect(canUseAffinityPlainSummary(coveredButBroken as never, single as never)).toBe(false);
+			expect(isAffinityRebuildComplete(coveredButBroken as never, model as never)).toBe(false);
+			expect(buildAffinitySafePayload(model as never, piPayload(coveredButBroken), coveredButBroken as never, single as never)).toEqual({ ok: false });
+			expect(() => buildAffinityRetiredSessionMessages(coveredButBroken as never, model as never)).toThrow("Cannot recover every opaque Responses compaction");
+			expect(JSON.stringify(coveredButBroken)).toBe(before);
+
+			// The shortcut must still work without pre-boundary transcript evidence.
+			for (const retainNone of [false, true]) {
+				const entry = compactionEntry("single", [SIGNED], "Cat is Biscuit.");
+				entry.details.strategy = strategy;
+				entry.firstKeptEntryId = retainNone ? entry.id : "kept";
+				const valid = linkBranch([
+					...(retainNone ? [] : [userEntry("kept", "kept")]), entry, userEntry("tail", "Next question"),
+				]);
+				expect(canUseAffinityPlainSummary(valid as never, entry as never)).toBe(true);
+				expect(isAffinityRebuildComplete(valid as never, model as never)).toBe(true);
+				expect(buildAffinitySafePayload(model as never, piPayload(valid), valid as never, entry as never)).toEqual({ ok: true });
+				expect(buildAffinityRetiredSessionMessages(valid as never, model as never)).toEqual(contextMessages(valid));
+			}
+		}
+	});
 
 	/** Neither a readable native summary nor its checkpoint metadata proves coverage. */
 	function summarizedTwoWindowBranch(

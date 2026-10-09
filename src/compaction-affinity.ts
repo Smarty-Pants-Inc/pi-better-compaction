@@ -72,9 +72,13 @@ function isResponsesNativeCompaction(entry: SessionEntry): entry is NativeCompac
 		(entry.details.strategy === NATIVE_COMPACTION_STRATEGY || entry.details.strategy === NATIVE_COMPACTION_STRATEGY_V2);
 }
 
-/** Preserve the existing one-window plain-summary resend without recompaction. */
+/** A single plain summary may skip transcript evidence, never original branch structure. */
 export function canUseAffinityPlainSummary(entries: readonly SessionEntry[], entry: NativeCompactionEntry): boolean {
-	return hasPlainSummary(entry) && entries.filter(isResponsesNativeCompaction).length === 1;
+	if (!hasPlainSummary(entry) || entries.filter(isResponsesNativeCompaction).length !== 1) return false;
+	const index = entries.indexOf(entry);
+	if (index < 0) return false;
+	const positions = new Map(entries.map((candidate, at) => [candidate.id, at]));
+	return getIntactCompactionWindowStart(entries, index, undefined, positions) !== undefined;
 }
 
 function chainBranch(entries: readonly SessionEntry[]): SessionEntry[] {
@@ -140,6 +144,38 @@ function hasCompleteToolPairs(messages: AgentMessage[]): boolean {
  * not at the previous checkpoint. Include the kept suffix up to the checkpoint:
  * native Responses compaction also replaces assistant answers/tools in that suffix.
  */
+function getIntactCompactionWindowStart(
+	entries: readonly SessionEntry[],
+	index: number,
+	previousCompactionIndex: number | undefined,
+	positions: ReadonlyMap<string, number>,
+): number | undefined {
+	const entry = entries[index] as CompactionEntry;
+	const boundary = positions.get(entry.firstKeptEntryId);
+	if (boundary === undefined || boundary > index) return undefined;
+	let start = 0;
+	if (previousCompactionIndex !== undefined) {
+		const previous = entries[previousCompactionIndex] as CompactionEntry;
+		const previousBoundary = positions.get(previous.firstKeptEntryId);
+		if (previousBoundary === undefined || previousBoundary > previousCompactionIndex) return undefined;
+		// Pi's retain-none sentinel is the checkpoint's own ID.
+		start = previousBoundary === previousCompactionIndex ? previousCompactionIndex + 1 : previousBoundary;
+	}
+	if (boundary < start || start > index) return undefined;
+	if (previousCompactionIndex === undefined) {
+		if (entries[start]!.parentId !== null) return undefined;
+	} else if (start === previousCompactionIndex + 1 && entries[start]!.parentId !== entries[previousCompactionIndex]!.id) {
+		return undefined;
+	}
+	// The previous kept entry is the trusted start anchor; everything after
+	// it, including this checkpoint's parent, must be the original chain.
+	for (let at = start + 1; at <= index; at++) {
+		if (entries[at]!.parentId !== entries[at - 1]!.id) return undefined;
+	}
+	return start;
+}
+
+/** Structural validity alone is not transcript evidence for an opaque window. */
 function hasCoveredTranscriptWindow(
 	entries: readonly SessionEntry[],
 	index: number,
@@ -147,28 +183,9 @@ function hasCoveredTranscriptWindow(
 	positions: ReadonlyMap<string, number>,
 	model?: Pick<Model<Api>, "input">,
 ): boolean {
+	const start = getIntactCompactionWindowStart(entries, index, previousCompactionIndex, positions);
+	if (start === undefined || start >= index) return false;
 	const entry = entries[index] as CompactionEntry;
-	const boundary = positions.get(entry.firstKeptEntryId);
-	if (boundary === undefined || boundary > index) return false;
-	let start = 0;
-	if (previousCompactionIndex !== undefined) {
-		const previous = entries[previousCompactionIndex] as CompactionEntry;
-		const previousBoundary = positions.get(previous.firstKeptEntryId);
-		if (previousBoundary === undefined || previousBoundary > previousCompactionIndex) return false;
-		// Pi's retain-none sentinel is the checkpoint's own ID.
-		start = previousBoundary === previousCompactionIndex ? previousCompactionIndex + 1 : previousBoundary;
-	}
-	if (boundary < start || start >= index) return false;
-	if (previousCompactionIndex === undefined) {
-		if (entries[start]!.parentId !== null) return false;
-	} else if (start === previousCompactionIndex + 1 && entries[start]!.parentId !== entries[previousCompactionIndex]!.id) {
-		return false;
-	}
-	// The previous kept entry is the trusted start anchor; everything after
-	// it, including this checkpoint's parent, must be the original chain.
-	for (let at = start + 1; at <= index; at++) {
-		if (entries[at]!.parentId !== entries[at - 1]!.id) return false;
-	}
 	const transcript = entries.slice(start, index).filter((candidate) =>
 		candidate.type !== "compaction" && candidate.type !== "branch_summary",
 	);
@@ -190,6 +207,12 @@ function hasCoveredTranscriptWindow(
  * retirement markers or later summaries: none proves that its transcript exists.
  */
 function rebuildAffinityBranch(entries: readonly SessionEntry[], model?: Pick<Model<Api>, "input">): SessionEntry[] | undefined {
+	const checkpoints = entries.filter(isResponsesNativeCompaction);
+	if (checkpoints.length === 1 && hasPlainSummary(checkpoints[0]!) && !canUseAffinityPlainSummary(entries, checkpoints[0]!)) {
+		// A preceding nonnative checkpoint can narrow transcript coverage, but it
+		// must not let a denied summary shortcut repair a broken root-to-checkpoint chain.
+		return undefined;
+	}
 	const rebuilt: SessionEntry[] = [];
 	const positions = new Map<string, number>();
 	let previousCompactionIndex: number | undefined;
@@ -198,8 +221,8 @@ function rebuildAffinityBranch(entries: readonly SessionEntry[], model?: Pick<Mo
 		if (!entry.id || positions.has(entry.id)) return undefined;
 		positions.set(entry.id, index);
 		if (isResponsesNativeCompaction(entry)) {
-			// A single plain checkpoint needs no reconstruction, even when an import
-			// retains only its kept window. Keep its summary for later /compact too.
+			// A structurally intact single plain checkpoint needs no transcript evidence,
+			// even if an import retains only its kept window. Keep its summary for /compact.
 			const usePlainSummary = canUseAffinityPlainSummary(entries, entry);
 			// Outside that legacy shortcut, a summary can never override failed coverage.
 			if (!usePlainSummary && !hasCoveredTranscriptWindow(entries, index, previousCompactionIndex, positions, model)) return undefined;
@@ -243,7 +266,7 @@ export function buildAffinityRetiredSessionMessages(entries: readonly SessionEnt
 
 /**
  * The request to send while the latest compaction is retired. A single plain-text
- * summary means Pi's own payload is already safe: `{ ok: true }`. Otherwise the
+ * summary on an intact branch means Pi's own payload is safe: `{ ok: true }`. Otherwise the
  * history lives only in the rejected signed item, so send the full branch
  * transcript rather than a payload that silently drops it. `{ ok: false }` when
  * neither is safe (any opaque window has no recoverable transcript, or the
