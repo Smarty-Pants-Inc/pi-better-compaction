@@ -11,8 +11,8 @@ permissions:
 jobs:
   check:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    # smarty-dev#8527: merge-queue drafts and priority-ci PRs ask for smarty-priority (reserved priority VMs).
-    runs-on: ${{ (startsWith(github.head_ref, 'mergify/merge-queue/') || startsWith(github.head_ref, 'tmp-mergify/merge-queue/') || contains(github.event.pull_request.labels.*.name, 'priority-ci')) && 'smarty-priority' || 'smarty-linux-x64' }}
+    # smarty-dev#8527: stays a literal label; scripts/ci/no-hosted-runners.sh refuses runs-on expressions.
+    runs-on: smarty-linux-x64
     timeout-minutes: 20
     strategy:
       matrix:
