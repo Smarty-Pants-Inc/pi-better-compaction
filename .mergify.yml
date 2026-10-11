@@ -10,7 +10,8 @@ queue_rules:
   - name: default
     batch_size: 4
     batch_max_wait_time: 2 min
-    checks_timeout: 30 min
+    # Queue drafts can wait over an hour for a Forge runner (smarty-dev#8742: pbc#25 was dropped twice green).
+    checks_timeout: 90 min
     merge_method: merge
     queue_conditions:
       - base = main
