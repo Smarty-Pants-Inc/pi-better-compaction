@@ -95,6 +95,9 @@ function piPayload(model = opus, summary = BLOCK.content) {
 	};
 }
 
+/** Exact assistant errorMessage from Pi 21ab152c and CPA f7c9c298 /v1/messages. */
+const AFFINITY_409 = '409 {"type":"error","error":{"type":"invalid_request_error","message":"compaction_affinity_missing: signed compaction account is unknown; start a new conversation or recompact without the signed block"}}';
+
 /** The error text Pi 0.87 recorded for the rejected block in the smarty-dev#251 proof. */
 const REJECTED_BLOCK_ERROR =
 	'400 {"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content.0: invalid `signature` in `compaction` block"}}';
@@ -543,6 +546,72 @@ describe("runtime", () => {
 		expect(await h.call("before_provider_request", { payload: piPayload() }, h.context(opus, branch))).toBeUndefined();
 		// If the resend fails the same way, nothing retries again.
 		expect(await h.call("turn_end", turnEnd(REJECTED_BLOCK_ERROR), h.context(opus, branch))).toBeUndefined();
+		expect(await h.call("agent_before_settle", {}, h.context(opus, branch))).toBeUndefined();
+	});
+
+	test("Anthropic affinity 409 recompacts the plain summary without the retired block and resends once", async () => {
+		const fresh = { ...BLOCK, signature: "sig-current-account" };
+		const h = harness({ ok: true, block: fresh, messageId: "msg_fresh" });
+		const branch: unknown[] = [userEntry("kept", "kept"), anthropicCompactionEntry("c1", "kept"), userEntry("u2", "next question")];
+		await h.call("before_provider_request", { payload: piPayload() }, h.context(opus, branch));
+		branch.push({ type: "message", id: "a1", message: rejectedTurn(AFFINITY_409) });
+		const boundary = await h.call("turn_end", turnEnd(AFFINITY_409), h.context(opus, branch)) as { entries: Array<Record<string, any>> };
+		expect(boundary).toBeDefined();
+		expect(h.anthropicCalls).toHaveLength(1);
+		const call = h.anthropicCalls[0]!;
+		expect(call.priorReplay).toBeUndefined();
+		expect(call.messages).toEqual([{
+			role: "compactionSummary", summary: BLOCK.content, tokensBefore: 900_000,
+			timestamp: new Date("2026-09-23T08:01:00.000Z").getTime(),
+		}]);
+		expect(JSON.stringify(call)).not.toContain(BLOCK.signature);
+		expect(boundary.entries.slice(0, 2)).toEqual([
+			{ type: "custom", customType: ANTHROPIC_BLOCK_REJECTED_ENTRY, data: { compactionEntryId: "c1" } },
+			{ type: "context_edit", targetId: "a1", replacement: null },
+		]);
+		expect(boundary.entries[2]).toMatchObject({
+			type: "compaction", firstKeptEntryId: "kept", summary: fresh.content,
+			details: { strategy: ANTHROPIC_COMPACTION_STRATEGY, compactedWindow: [fresh] },
+		});
+		branch.push(...boundary.entries.map((entry, index) => ({ ...entry, id: `fresh-${index}` })));
+		expect(await h.call("agent_before_settle", {}, h.context(opus, branch))).toEqual({ continue: true });
+		expect(await h.call("agent_before_settle", {}, h.context(opus, branch))).toBeUndefined();
+		const resend = await h.call("before_provider_request", { payload: piPayload(opus, fresh.content) }, h.context(opus, branch)) as any;
+		expect(resend.messages[0]).toEqual({ role: "assistant", content: [fresh] });
+		expect(resend.messages.slice(1)).toEqual(piPayload().messages.slice(1));
+		// The fresh signer may also be unknown: never loop in the same user prompt.
+		expect(await h.call("turn_end", turnEnd(AFFINITY_409), h.context(opus, branch))).toBeUndefined();
+		expect(await h.call("agent_before_settle", {}, h.context(opus, branch))).toBeUndefined();
+		expect(h.anthropicCalls).toHaveLength(1);
+		await h.call("before_agent_start", {}, h.context(opus, branch));
+		await h.call("before_provider_request", { payload: piPayload(opus, fresh.content) }, h.context(opus, branch));
+		expect(await h.call("turn_end", turnEnd(AFFINITY_409), h.context(opus, branch))).toBeDefined();
+		expect(h.anthropicCalls).toHaveLength(2);
+	});
+
+	test("Anthropic affinity recompaction failure retires the old block but does not resend", async () => {
+		const h = harness({ ok: false, reason: "request-failed", status: 503 });
+		const branch: unknown[] = [userEntry("kept", "kept"), anthropicCompactionEntry("c1", "kept"), userEntry("u2", "next")];
+		await h.call("before_provider_request", { payload: piPayload() }, h.context(opus, branch));
+		branch.push({ type: "message", id: "a1", message: rejectedTurn(AFFINITY_409) });
+		expect(await h.call("turn_end", turnEnd(AFFINITY_409), h.context(opus, branch))).toEqual({
+			entries: [{ type: "custom", customType: ANTHROPIC_BLOCK_REJECTED_ENTRY, data: { compactionEntryId: "c1" } }],
+		});
+		expect(h.anthropicCalls).toHaveLength(1);
+		expect(h.fallbackCalls).toHaveLength(0);
+		expect(await h.call("agent_before_settle", {}, h.context(opus, branch))).toBeUndefined();
+	});
+
+	test("Anthropic affinity recovery requires our replay and a boundary-capable runtime", async () => {
+		const h = harness();
+		const branch = [userEntry("kept", "kept"), anthropicCompactionEntry("c1", "kept")];
+		await h.call("before_provider_request", { payload: piPayload(sonnet) }, h.context(sonnet, branch));
+		expect(await h.call("turn_end", turnEnd(AFFINITY_409), h.context(sonnet, branch))).toBeUndefined();
+		await h.call("before_provider_request", { payload: piPayload() }, h.context(opus, branch));
+		const { messageEntryId: _, ...olderTurnEnd } = turnEnd(AFFINITY_409);
+		expect(await h.call("turn_end", olderTurnEnd, h.context(opus, branch))).toBeUndefined();
+		expect(h.appended).toEqual([{ customType: ANTHROPIC_BLOCK_REJECTED_ENTRY, data: { compactionEntryId: "c1" } }]);
+		expect(h.anthropicCalls).toHaveLength(0);
 		expect(await h.call("agent_before_settle", {}, h.context(opus, branch))).toBeUndefined();
 	});
 
