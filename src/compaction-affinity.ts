@@ -33,10 +33,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function hasAffinityCode(error: unknown): boolean {
-	return isRecord(error) && (error.code === AFFINITY_CODE || error.type === AFFINITY_CODE);
+	if (!isRecord(error)) return false;
+	return error.code === AFFINITY_CODE || error.type === AFFINITY_CODE ||
+		(typeof error.message === "string" && error.message.startsWith(`${AFFINITY_CODE}:`));
 }
 
-/** Exactly the gateway's 409 with code `compaction_affinity_missing` at `error.code` or `error.type`. */
+/** Gateway 409: structured affinity code/type, or its marker prefix in the JSON error message. */
 export function isCompactionAffinityMissing(message: AgentMessage): boolean {
 	if (message.role !== "assistant" || message.stopReason !== "error") return false;
 	const match = STATUS_409_BODY.exec(message.errorMessage ?? "");
