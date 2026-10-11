@@ -10,7 +10,8 @@ queue_rules:
   - name: default
     batch_size: 4
     batch_max_wait_time: 2 min
-    checks_timeout: 30 min
+    # smarty-dev#8527: 180 min fleet-wide, above the measured CI wait (queue drafts wait for a runner first).
+    checks_timeout: 180 min
     merge_method: merge
     queue_conditions:
       - base = main
