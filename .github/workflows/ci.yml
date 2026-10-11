@@ -11,7 +11,7 @@ permissions:
 jobs:
   check:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: smarty-linux-x64
+    runs-on: ${{ startsWith(github.head_ref || github.ref_name, 'mergify/merge-queue/') && 'smarty-priority' || 'smarty-linux-x64' }}
     timeout-minutes: 20
     strategy:
       matrix:
