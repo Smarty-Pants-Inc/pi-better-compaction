@@ -27,6 +27,8 @@ const body = (code: string, field: "code" | "type" = "code") =>
 		...(field === "code" ? { code } : {}),
 	});
 const AFFINITY_409 = `cliproxyapi API error (409): ${body("compaction_affinity_missing")}`;
+const RESPONSES_AFFINITY_409 = 'cliproxyapi API error (409): {"message":"compaction_affinity_missing: signed compaction account is unknown; start a new conversation or recompact without the signed block","type":"invalid_request_error"}';
+const ANTHROPIC_AFFINITY_409 = `409 {"type":"error","error":{"type":"invalid_request_error","message":"compaction_affinity_missing: signed compaction account is unknown; start a new conversation or recompact without the signed block"}}`;
 
 function userEntry(id: string, text: string) {
 	return { type: "message", id, timestamp: "2026-10-06T08:00:00.000Z", message: { role: "user", content: [{ type: "text", text }], timestamp: 1 } };
@@ -173,9 +175,16 @@ function commit(branch: unknown[], boundary: unknown) {
 }
 
 describe("isCompactionAffinityMissing", () => {
-	test("matches only a 409 whose error code or type is compaction_affinity_missing", () => {
+	test("matches only a 409 with the affinity code, type or gateway message prefix", () => {
 		const turn = (text: string) => errorTurn(text) as never;
 		expect(isCompactionAffinityMissing(turn(AFFINITY_409))).toBe(true);
+		// Exact Pi 21ab152c Anthropic Messages error text from CPA f7c9c298.
+		expect(isCompactionAffinityMissing(turn(ANTHROPIC_AFFINITY_409))).toBe(true);
+		// The same gateway also puts the marker only in message on Responses.
+		expect(isCompactionAffinityMissing(turn(RESPONSES_AFFINITY_409))).toBe(true);
+		expect(isCompactionAffinityMissing(turn(ANTHROPIC_AFFINITY_409.replace(/^409/, "400")))).toBe(false);
+		expect(isCompactionAffinityMissing(turn(ANTHROPIC_AFFINITY_409.replace("compaction_affinity_missing:", "compaction_affinity_conflict:")))).toBe(false);
+		expect(isCompactionAffinityMissing(turn(ANTHROPIC_AFFINITY_409.replace("compaction_affinity_missing:", "unrelated: compaction_affinity_missing:")))).toBe(false);
 		expect(isCompactionAffinityMissing(turn(`OpenAI API error (409): ${body("compaction_affinity_missing", "type")}`))).toBe(true);
 		expect(isCompactionAffinityMissing(turn(`409: {"error":${body("compaction_affinity_missing")}}`))).toBe(true);
 

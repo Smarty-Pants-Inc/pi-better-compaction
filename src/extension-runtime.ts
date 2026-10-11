@@ -561,6 +561,7 @@ async function runAnthropicCompact(
 	config: ExtensionConfig,
 	dependencies: ExtensionRuntimeDependencies,
 	state: RuntimeState,
+	omitPriorReplay = false,
 ): Promise<ResponsesCompactOutcome> {
 	const identity = getAnthropicIdentity(ctx);
 	if (!identity || !ctx.model) {
@@ -585,7 +586,7 @@ async function runAnthropicCompact(
 
 	const branchEntries = ctx.sessionManager.getBranch();
 	const previous = findLatestCompactionEntry(branchEntries);
-	const priorReplay = resolveAnthropicReplay(branchEntries, identity);
+	const priorReplay = omitPriorReplay ? undefined : resolveAnthropicReplay(branchEntries, identity);
 	const messages: AgentMessage[] = [
 		...(previous
 			? [{
@@ -1146,6 +1147,61 @@ async function recoverCompactionAffinity(
 	};
 }
 
+/**
+ * Anthropic checkpoints contain a plain summary alongside the signature. Re-sign
+ * that same summary on the current account, preserving the kept/live tail verbatim.
+ * Never replay the unknown signer into the recompaction request, or fall back to
+ * another compaction strategy when the current account cannot recompact it.
+ */
+async function recoverAnthropicCompactionAffinity(
+	pi: ExtensionAPI,
+	event: TurnEndEvent,
+	ctx: ExtensionContext,
+	compactionEntryId: string,
+	dependencies: ExtensionRuntimeDependencies,
+	state: RuntimeState,
+): Promise<TurnEndEventResult | undefined> {
+	const { config } = dependencies.loadExtensionConfig();
+	if (state.affinityRecoveryUsed) {
+		logAffinityRecovery(ctx, config, "already-recovered (one recovery per turn; not retrying again)", "error");
+		return undefined;
+	}
+	state.affinityRecoveryUsed = true;
+	const entry = findLatestCompactionEntry(ctx.sessionManager.getBranch());
+	if (!isNativeCompactionEntry(entry) || entry.id !== compactionEntryId ||
+		entry.details.strategy !== ANTHROPIC_COMPACTION_STRATEGY || !entry.summary.trim()) {
+		logAffinityRecovery(ctx, config, "blocked (the replayed Anthropic checkpoint has no current plain summary; nothing was resent)", "error");
+		return undefined;
+	}
+	const retire = { type: "custom" as const, customType: ANTHROPIC_BLOCK_REJECTED_ENTRY, data: { compactionEntryId } };
+	if (!event.messageEntryId) {
+		pi.appendEntry(retire.customType, retire.data);
+		logAffinityRecovery(ctx, config, "retired (this runtime cannot resend automatically; the next prompt uses the plain summary)", "error");
+		return undefined;
+	}
+	const compactEvent = {
+		type: "session_before_compact",
+		preparation: { firstKeptEntryId: entry.firstKeptEntryId, tokensBefore: entry.tokensBefore, messagesToSummarize: [], turnPrefixMessages: [] },
+		signal: ctx.signal ?? new AbortController().signal,
+	} as unknown as SessionBeforeCompactEvent;
+	// Only the previous plain summary is recompressed; kept turns and the current
+	// prompt remain outside the new checkpoint, exactly as before the failed turn.
+	const outcome = await runAnthropicCompact(compactEvent, ctx, config, dependencies, state, true);
+	if (outcome.outcome !== "success") {
+		logAffinityRecovery(ctx, config, "blocked (Anthropic recompaction on this account failed; nothing was resent; run /compact or retry)", "error");
+		return { entries: [retire] };
+	}
+	state.resendAfterAffinityRecovery = true;
+	logAffinityRecovery(ctx, config, "retrying (Anthropic compaction retired and recompacted on this account; resending once)");
+	return {
+		entries: [
+			retire,
+			{ type: "context_edit", targetId: event.messageEntryId, replacement: null },
+			{ type: "compaction", summary: outcome.compaction.summary, firstKeptEntryId: entry.firstKeptEntryId, details: outcome.compaction.details },
+		],
+	};
+}
+
 export function registerExtensionRuntime(
 	pi: ExtensionAPI,
 	dependencies: ExtensionRuntimeDependencies = DEFAULT_DEPENDENCIES,
@@ -1212,6 +1268,9 @@ export function registerExtensionRuntime(
 		state.pendingAnthropicReplay = undefined;
 		if (responsesReplay && isCompactionAffinityMissing(event.message)) {
 			return recoverCompactionAffinity(pi, event, ctx, responsesReplay, dependencies, state);
+		}
+		if (compactionEntryId && isCompactionAffinityMissing(event.message)) {
+			return recoverAnthropicCompactionAffinity(pi, event, ctx, compactionEntryId, dependencies, state);
 		}
 		if (!compactionEntryId || !isAnthropicBlockRejection(event.message)) return undefined;
 		if (!event.messageEntryId) {
