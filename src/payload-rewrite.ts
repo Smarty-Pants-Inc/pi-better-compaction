@@ -330,6 +330,15 @@ export function extractFreshAuthoritativePreamble(
 		trailingBoundary -= 1;
 	}
 
+	// Without session history, no parity gate can distinguish a transcript
+	// section update from an unrecognized interior prompt. Affinity recovery
+	// uses this conservative mode and must fail closed rather than drop it.
+	if (historyInput.length === 0) {
+		for (let index = leadingBoundary; index < trailingBoundary; index++) {
+			if (isPromptEnvelopeItem(payload.input[index])) return undefined;
+		}
+	}
+
 	// A transcript can itself end in a system update. Keep that suffix inside
 	// history rather than mistaking it for a provider-authored trailing prompt.
 	let historyTrailingCount = 0;
