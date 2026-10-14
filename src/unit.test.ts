@@ -174,6 +174,49 @@ test("serializer skips non-tool-result roles and normalizes non-array tool-resul
 	expect(JSON.stringify(input)).toContain("legacy string tool result");
 });
 
+test.each(["openai-responses", "openai-codex-responses"])(
+	"serializer omits mismatched function-call item IDs for %s",
+	(api) => {
+		const model = { ...baseModel, api, provider: api === "openai-codex-responses" ? "openai-codex" : "openai" };
+		for (const rawItemId of ["ctc_codemode", "legacy_item", "fc_read", undefined]) {
+			const toolCallId = rawItemId ? `call_1|${rawItemId}` : "call_1";
+			const request = serializeMessagesToCompactRequest({
+				model: model as never,
+				instructions: "compact this",
+				messages: [
+					{
+						role: "assistant",
+						provider: model.provider,
+						api: model.api,
+						model: model.id,
+						stopReason: "toolUse",
+						content: [{ type: "toolCall", id: toolCallId, name: "codemode", arguments: { code: "return 1;" } }],
+						timestamp: 1,
+					},
+					{
+						role: "toolResult",
+						toolCallId,
+						toolName: "codemode",
+						content: [{ type: "text", text: "1" }],
+						isError: false,
+						timestamp: 2,
+					},
+				] as never,
+			});
+			expect(JSON.parse(JSON.stringify(request.input))).toEqual([
+				{
+					type: "function_call",
+					...(rawItemId === "fc_read" ? { id: rawItemId } : {}),
+					call_id: "call_1",
+					name: "codemode",
+					arguments: '{"code":"return 1;"}',
+				},
+				{ type: "function_call_output", call_id: "call_1", output: "1" },
+			]);
+		}
+	},
+);
+
 test("extractCompactedSummaryText joins assistant output_text blocks and skips opaque items", () => {
 	expect(
 		extractCompactedSummaryText([

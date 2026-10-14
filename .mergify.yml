@@ -8,8 +8,10 @@ merge_queue:
 # titles keep a PR out.
 queue_rules:
   - name: default
-    batch_size: 1
-    checks_timeout: 30 min
+    batch_size: 4
+    batch_max_wait_time: 2 min
+    # smarty-dev#8527: 180 min fleet-wide, above the measured CI wait (queue drafts wait for a runner first).
+    checks_timeout: 180 min
     merge_method: merge
     queue_conditions:
       - base = main
@@ -43,6 +45,16 @@ commands_restrictions:
           - sender = smarty-fleet-write-leads[bot]
           - sender = smarty-fleet-write-lanes[bot]
           - sender = smarty-fleet-write-versehq[bot]
+  # The same allowance for `requeue` (smarty-dev#7327): without it Mergify refuses a fleet bot's requeue
+  # ('Command disallowed'), and a dequeued PR sits until someone notices (k3#958, ~18.5 h on 10-08).
+  requeue:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
   # The stuck-work check's R4 posts `@mergifyio refresh` as the write App (smarty-dev#868, #983).
   refresh:
     conditions:
@@ -52,3 +64,13 @@ commands_restrictions:
           - sender = smarty-fleet-write-leads[bot]
           - sender = smarty-fleet-write-lanes[bot]
           - sender = smarty-fleet-write-versehq[bot]
+
+# Sanctioned front-of-queue route, as smarty-dev (#2004 T10; org for Paul 2026-10-02): a PR labelled p0 is
+# checked ahead of the rest of the queue.
+priority_rules:
+  - name: p0
+    conditions:
+      - label = p0
+    priority: high
+    # Priority must not discard in-flight CI (smarty-dev decision #2143, proven #2356).
+    allow_checks_interruption: false
