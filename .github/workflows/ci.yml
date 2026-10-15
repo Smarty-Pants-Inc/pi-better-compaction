@@ -11,8 +11,14 @@ permissions:
 jobs:
   check:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    # smarty-dev#8527: stays a literal label; scripts/ci/no-hosted-runners.sh refuses runs-on expressions.
-    runs-on: smarty-linux-x64
+    # Exact reserved-pool route allowlisted by scripts/ci/no-hosted-runners.sh:
+    # merge-queue heads first, fleet-unblock/priority-ci next, otherwise the default pool.
+    runs-on: >-
+      ${{ (startsWith(github.head_ref, 'mergify/merge-queue/') ||
+           startsWith(github.head_ref, 'tmp-mergify/merge-queue/')) && 'smarty-merge-queue' ||
+          (contains(github.event.pull_request.labels.*.name, 'fleet-unblock') ||
+           contains(github.event.pull_request.labels.*.name, 'priority-ci')) && 'smarty-priority' ||
+          'smarty-linux-x64' }}
     timeout-minutes: 20
     strategy:
       matrix:

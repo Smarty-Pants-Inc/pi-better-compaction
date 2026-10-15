@@ -31,6 +31,50 @@ expect_accepted() {
   echo "PASS: accepted $name"
 }
 
+# Trust boundary: only this complete folded scalar may bypass matrix resolution.
+# Keep the continuation indentation identical to tristar-root-proof.yml lines 38–44.
+canonical_route="jobs:
+  check:
+    runs-on: >-
+      \${{ (startsWith(github.head_ref, 'mergify/merge-queue/') ||
+           startsWith(github.head_ref, 'tmp-mergify/merge-queue/')) && 'smarty-merge-queue' ||
+          (contains(github.event.pull_request.labels.*.name, 'fleet-unblock') ||
+           contains(github.event.pull_request.labels.*.name, 'priority-ci')) && 'smarty-priority' ||
+          'smarty-linux-x64' }}"
+expect_accepted 'canonical reserved-pool folded route' "$canonical_route"
+# Preserve the exact scalar bytes while nesting it in each runner container form.
+container_route="${canonical_route#*runs-on: }"
+container_route="${container_route//$'\n'/$'\n  '}"
+labels_list_route="${container_route//$'\n'/$'\n  '}"
+expect_rejected 'reserved-pool route in direct label-list' "jobs:
+  check:
+    runs-on:
+      - $container_route
+      - self-hosted" 'unresolvable runner'
+expect_rejected 'reserved-pool route in mapping labels scalar' "jobs:
+  check:
+    runs-on:
+      labels: $container_route" 'unresolvable runner'
+expect_rejected 'reserved-pool route in mapping labels list' "jobs:
+  check:
+    runs-on:
+      labels:
+        - $labels_list_route
+        - self-hosted" 'unresolvable runner'
+expect_rejected 'reserved-pool route in mapping group' "jobs:
+  check:
+    runs-on:
+      group: $container_route" 'unresolvable runner'
+expect_rejected 'reserved-pool route with hosted fallback' \
+  "${canonical_route//smarty-linux-x64/ubuntu-latest}" 'unresolvable runner'
+expect_rejected 'reserved-pool route with changed whitespace' \
+  "${canonical_route/startsWith(/startsWith( }" 'unresolvable runner'
+expect_rejected 'prefixed reserved-pool route' \
+  "${canonical_route/      /      prefix-}" 'unresolvable runner'
+route_end="'smarty-linux-x64' }}"
+expect_rejected 'suffixed reserved-pool route' \
+  "${canonical_route/"$route_end"/"$route_end-suffix"}" 'unresolvable runner'
+
 expect_rejected 'bare exception marker' $'jobs:\n  check:\n    # hosted-exception:\n    runs-on: ubuntu-latest'
 expect_rejected 'folded hosted runs-on' $'jobs:\n  check:\n    runs-on: >-\n      ubuntu-latest'
 expect_rejected 'plain hosted runs-on' $'jobs:\n  check:\n    runs-on: ubuntu-latest'
