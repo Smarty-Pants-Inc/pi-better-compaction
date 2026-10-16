@@ -4,6 +4,14 @@ import { join } from "node:path";
 type RecordValue = Record<string, unknown>;
 const hosted = /^(ubuntu|windows|macos)-/;
 const matrixPath = /^matrix\.([A-Za-z_][A-Za-z0-9_-]*)(?:\.([A-Za-z_][A-Za-z0-9_-]*))?$/;
+// Exact Bun YAML value of tristar-root-proof.yml's folded runs-on (lines 38–44).
+// More-indented continuation lines retain their newlines and indentation.
+// All possible outputs are self-hosted: smarty-merge-queue, smarty-priority, smarty-linux-x64.
+const reservedPoolRoute = `\${{ (startsWith(github.head_ref, 'mergify/merge-queue/') ||
+     startsWith(github.head_ref, 'tmp-mergify/merge-queue/')) && 'smarty-merge-queue' ||
+    (contains(github.event.pull_request.labels.*.name, 'fleet-unblock') ||
+     contains(github.event.pull_request.labels.*.name, 'priority-ci')) && 'smarty-priority' ||
+    'smarty-linux-x64' }}`;
 const isRecord = (value: unknown): value is RecordValue =>
 	value !== null && typeof value === "object" && !Array.isArray(value);
 const owns = (value: RecordValue, key: string) => Object.hasOwn(value, key);
@@ -116,6 +124,9 @@ function resolve(label: string, row: RecordValue): string {
 }
 
 function checkRunner(value: unknown, job: RecordValue, strict: boolean) {
+	// Only the complete, byte-exact scalar route is allowlisted, never a
+	// substring or a member of a runner mapping/list.
+	if (value === reservedPoolRoute) return;
 	const labels = runnerValues(value, strict);
 	let rows: RecordValue[] = [{}];
 	if (labels.some((label) => /\$\{\{\s*matrix\./.test(label))) {
