@@ -2,7 +2,8 @@ import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 type RecordValue = Record<string, unknown>;
-const hosted = /^(ubuntu|windows|macos)-/;
+// Public repositories may not select self-hosted pools or larger-runner labels.
+const hosted = /^(ubuntu-(latest|22\.04|24\.04)(-arm)?|windows-(latest|2022|2025|11-arm)|macos-(latest|14|15|15-intel|26|26-intel))$/;
 const matrixPath = /^matrix\.([A-Za-z_][A-Za-z0-9_-]*)(?:\.([A-Za-z_][A-Za-z0-9_-]*))?$/;
 const isRecord = (value: unknown): value is RecordValue =>
 	value !== null && typeof value === "object" && !Array.isArray(value);
@@ -85,6 +86,7 @@ function runnerValues(value: unknown, strict: boolean): string[] {
 		} else scalar(item);
 	}
 	if (isRecord(value)) {
+		if (owns(value, "group")) unresolved("runner groups are not standard GitHub-hosted runners");
 		if (strict && (Object.keys(value).some((key) => key !== "labels" && key !== "group") ||
 			(!owns(value, "labels") && !owns(value, "group")))) {
 			unresolved("runner mapping supports only labels/group");
@@ -130,7 +132,7 @@ function checkRunner(value: unknown, job: RecordValue, strict: boolean) {
 				if (strict) throw error;
 				continue;
 			}
-			if (hosted.test(resolved)) throw new Error(`unapproved hosted runner: ${resolved}`);
+			if (!hosted.test(resolved)) throw new Error(`not a standard GitHub-hosted runner: ${resolved}`);
 		}
 	}
 }
@@ -161,7 +163,7 @@ async function main() {
 				if (!isRecord(job)) unresolved("job must be a mapping");
 				if (owns(job, "uses")) {
 					// Reusable workflows do not select a runner here. Only reject a
-					// runs-on input when its resolved value is a hosted label.
+					// runs-on input when its resolved value is not a standard hosted label.
 					if (isRecord(job.with) && owns(job.with, "runs-on")) checkRunner(job.with["runs-on"], job, false);
 				} else checkRunner(job["runs-on"], job, true);
 			} catch (error) {
@@ -171,7 +173,7 @@ async function main() {
 		}
 	}
 	if (failed) process.exitCode = 1;
-	else console.log(`PASS: no hosted runners in ${files.length} workflow(s)`);
+	else console.log(`PASS: standard GitHub-hosted runners in ${files.length} workflow(s)`);
 }
 
 await main().catch((error: unknown) => {
