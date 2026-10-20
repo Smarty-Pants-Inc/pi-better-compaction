@@ -11,8 +11,8 @@ permissions:
 jobs:
   check:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    # smarty-dev#8527: stays a literal label; scripts/ci/no-hosted-runners.sh refuses runs-on expressions.
-    runs-on: smarty-linux-x64
+    # Public repositories use standard GitHub-hosted runners only.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       matrix:
@@ -30,7 +30,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.4.0'
-      - name: Reject unapproved hosted runners
+      - name: Require standard GitHub-hosted runners
         run: bash scripts/ci/no-hosted-runners.sh
       - name: Test hosted-runner guard
         run: bash scripts/ci/test-no-hosted-runners.sh
