@@ -189,10 +189,17 @@ function getSessionId(ctx: ExtensionContext): string | undefined {
 	}
 }
 
-// The live session manager has buildSessionContext(); Pi's read-only extension type omits it.
-function buildSessionMessages(ctx: ExtensionContext): AgentMessage[] {
-	return (ctx.sessionManager as unknown as { buildSessionContext(): { messages: AgentMessage[] } })
-		.buildSessionContext().messages;
+// Pi hands extensions a ReadonlySessionManager (a detached view) without buildSessionContext();
+// its documented buildSessionProjection() carries the same resolved messages. Use the live
+// method only when an older Pi passes the live manager.
+export function buildSessionMessages(ctx: Pick<ExtensionContext, "sessionManager">): AgentMessage[] {
+	const manager = ctx.sessionManager as unknown as {
+		buildSessionContext?: () => { messages: AgentMessage[] };
+		buildSessionProjection?: () => { messages: readonly AgentMessage[] };
+	};
+	if (typeof manager.buildSessionContext === "function") return manager.buildSessionContext().messages;
+	if (typeof manager.buildSessionProjection === "function") return [...manager.buildSessionProjection().messages];
+	throw new Error("session manager exposes neither buildSessionContext nor buildSessionProjection");
 }
 
 function notifyWarning(ctx: ExtensionContext, message: string): void {
